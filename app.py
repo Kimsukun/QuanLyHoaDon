@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 import pdfplumber
 import re
 from datetime import datetime
@@ -8,207 +7,254 @@ import time
 import base64
 import hashlib
 from io import BytesIO
+import gspread
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from gspread.exceptions import APIError
 
 # ==========================================
 # 1. CẤU HÌNH TRANG
 # ==========================================
 st.set_page_config(page_title="Quản Lý Hóa Đơn Pro", page_icon="📑", layout="wide")
 
-DB_FILE = 'invoice_data_pdf.db'
+# ==========================================
+# 2. KẾT NỐI GOOGLE SHEETS & DRIVE (CÓ CACHE)
+# ==========================================
+@st.cache_resource
+def get_creds():
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        scope = [
+            'https://www.googleapis.com/auth/spreadsheets', 
+            'https://www.googleapis.com/auth/drive'
+        ]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+        return creds
+    except Exception as e:
+        st.error(f"Lỗi credentials: {e}. Hãy kiểm tra file secrets.toml")
+        return None
 
-# ==========================================
-# 2. DATABASE
-# ==========================================
+def get_gspread_client():
+    creds = get_creds()
+    if creds:
+        return gspread.authorize(creds)
+    return None
+
+def get_drive_service():
+    creds = get_creds()
+    if creds:
+        return build('drive', 'v3', credentials=creds)
+    return None
+
+def get_db():
+    client = get_gspread_client()
+    if client:
+        try:
+            return client.open_by_url(st.secrets["sheets"]["url"])
+        except Exception as e:
+            return None
+    return None
+
+# --- HÀM KIỂM TRA KẾT NỐI ---
+def check_system_health():
+    status = {"sheet": False, "drive": False}
+    try:
+        sh = get_db()
+        if sh:
+            _ = sh.title 
+            status["sheet"] = True
+    except: pass
+
+    try:
+        service = get_drive_service()
+        if service:
+            # List thử 1 file để check quyền
+            service.files().list(pageSize=1).execute()
+            status["drive"] = True
+    except: pass
+    
+    return status
+
+# --- HÀM AN TOÀN CHỐNG QUOTA LIMIT (SHEET) ---
+def safe_get_worksheet(sh, title):
+    max_retries = 3
+    for i in range(max_retries):
+        try:
+            return sh.worksheet(title)
+        except APIError as e:
+            if e.response.status_code == 429:
+                time.sleep((2 ** i) + 1)
+            else:
+                raise e
+    return None
+
+def safe_get_all_records(ws):
+    max_retries = 3
+    for i in range(max_retries):
+        try:
+            return ws.get_all_records()
+        except APIError as e:
+            if e.response.status_code == 429:
+                time.sleep((2 ** i) + 1)
+            else:
+                raise e
+    return []
+
+# --- KHỞI TẠO DB ---
 def init_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    c = conn.cursor()
-    
-    # Bảng users
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, 
-        username TEXT UNIQUE, password TEXT, role TEXT, status TEXT
-    )''')
-    try: c.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'approved'")
+    sh = get_db()
+    if sh is None: return
+
+    tables = {
+        'users': ['id', 'username', 'password', 'role', 'status'],
+        'invoices': ['id', 'type', 'group_name', 'date', 'invoice_number', 'invoice_symbol', 
+                     'seller_name', 'seller_tax', 'buyer_name', 'pre_tax_amount', 'tax_amount', 
+                     'total_amount', 'file_name', 'status', 'edit_count', 'created_at', 'memo', 'drive_url'],
+        'projects': ['id', 'project_name', 'created_at'],
+        'project_links': ['id', 'project_id', 'invoice_id'],
+        'company_info': ['id', 'name', 'address', 'phone', 'logo_base64', 'bg_color', 'text_color', 'box_color']
+    }
+
+    try:
+        current_titles = [w.title for w in sh.worksheets()]
+        for table_name, headers in tables.items():
+            if table_name not in current_titles:
+                ws = sh.add_worksheet(title=table_name, rows=100, cols=20)
+                ws.append_row(headers)
+                if table_name == 'users':
+                    admin_pw = hashlib.sha256("admin123".encode()).hexdigest()
+                    ws.append_row([1, 'Admin', admin_pw, 'admin', 'approved'])
+                if table_name == 'company_info':
+                    ws.append_row([1, 'Tên Công Ty Của Bé', 'Địa chỉ', 'SĐT', '', '', '', ''])
+            else:
+                if table_name == 'invoices':
+                    ws = safe_get_worksheet(sh, 'invoices')
+                    current_headers = ws.row_values(1)
+                    if 'drive_url' not in current_headers:
+                        ws.update_cell(1, len(current_headers) + 1, 'drive_url')
     except: pass
 
-    # Admin mặc định
-    admin_pw = hashlib.sha256("admin123".encode()).hexdigest()
-    c.execute("INSERT OR IGNORE INTO users (username, password, role, status) VALUES ('Admin', ?, 'admin', 'approved')", (admin_pw,))
+if 'db_initialized' not in st.session_state:
+    init_db()
+    st.session_state.db_initialized = True
 
-    # Bảng hóa đơn
-    c.execute('''CREATE TABLE IF NOT EXISTS invoices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT, group_name TEXT, date TEXT, 
-        invoice_number TEXT, invoice_symbol TEXT,
-        seller_name TEXT, seller_tax TEXT, buyer_name TEXT,
-        pre_tax_amount REAL, tax_amount REAL, total_amount REAL,
-        file_name TEXT, status TEXT DEFAULT 'active',
-        edit_count INTEGER DEFAULT 0, 
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        memo TEXT
-    )''')
-    try: c.execute("ALTER TABLE invoices ADD COLUMN memo TEXT")
-    except: pass
-    
-    # Bảng dự án & liên kết
-    c.execute('''CREATE TABLE IF NOT EXISTS projects (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, project_name TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS project_links (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER, invoice_id INTEGER,
-        FOREIGN KEY(project_id) REFERENCES projects(id), FOREIGN KEY(invoice_id) REFERENCES invoices(id)
-    )''')
-
-    # Bảng thông tin công ty
-    c.execute('''CREATE TABLE IF NOT EXISTS company_info (
-        id INTEGER PRIMARY KEY, name TEXT, address TEXT, phone TEXT, logo BLOB,
-        bg_color TEXT, text_color TEXT, box_color TEXT
-    )''')
-    c.execute("INSERT OR IGNORE INTO company_info (id, name, address, phone) VALUES (1, 'Tên Công Ty Của Bé', 'Địa chỉ', 'SĐT')")
-    
-    conn.commit()
-    conn.close()
-
-init_db()
+# --- CÁC HÀM HỖ TRỢ KHÁC ---
+def get_next_id(worksheet):
+    col_values = worksheet.col_values(1)
+    if len(col_values) <= 1: return 1 
+    try:
+        ids = [int(x) for x in col_values[1:] if str(x).isdigit()]
+        return max(ids) + 1 if ids else 1
+    except: return 1
 
 def hash_pass(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
+@st.cache_data(ttl=600) 
 def get_company_data():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    sh = get_db()
+    if not sh: return None
     try:
-        df = pd.read_sql("SELECT * FROM company_info WHERE id=1", conn)
-    except:
-        init_db()
-        df = pd.read_sql("SELECT * FROM company_info WHERE id=1", conn)
-    conn.close()
-    return df.iloc[0] if not df.empty else None
+        ws = safe_get_worksheet(sh, 'company_info')
+        data = safe_get_all_records(ws)
+        if data:
+            row = data[0]
+            if row.get('logo_base64'):
+                row['logo'] = base64.b64decode(row['logo_base64'])
+            else:
+                row['logo'] = None
+            return pd.Series(row)
+    except: pass
+    return None
 
 def update_company_info(name, address, phone, logo_bytes=None):
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    c = conn.cursor()
+    sh = get_db()
+    if not sh: return
+    ws = safe_get_worksheet(sh, 'company_info')
+    ws.update_cell(2, 2, name)
+    ws.update_cell(2, 3, address)
+    ws.update_cell(2, 4, phone)
     if logo_bytes:
-        c.execute("UPDATE company_info SET name=?, address=?, phone=?, logo=? WHERE id=1", 
-                  (name, address, phone, logo_bytes))
-    else:
-        c.execute("UPDATE company_info SET name=?, address=?, phone=? WHERE id=1", 
-                  (name, address, phone))
-    conn.commit()
-    conn.close()
+        b64_str = base64.b64encode(logo_bytes).decode('utf-8')
+        ws.update_cell(2, 5, b64_str)
+    get_company_data.clear()
+
+# --- HÀM UPLOAD DRIVE (ĐÃ SỬA ĐỂ BẮT LỖI 403) ---
+def upload_to_drive(file_obj, file_name):
+    try:
+        service = get_drive_service()
+        if not service: 
+            return None, "Không kết nối được dịch vụ Google Drive."
+        
+        folder_id = None
+        try:
+            folder_id = st.secrets["drive"]["folder_id"]
+        except: 
+            return None, "Chưa cấu hình Folder ID trong secrets.toml"
+
+        file_metadata = {'name': file_name}
+        if folder_id:
+            file_metadata['parents'] = [folder_id]
+        
+        file_content = file_obj.getvalue()
+        buffer = BytesIO(file_content)
+        
+        media = MediaIoBaseUpload(buffer, mimetype='application/pdf', resumable=True)
+        
+        # Thêm supportsAllDrives=True để hỗ trợ Shared Drive nếu có
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id, webViewLink',
+            supportsAllDrives=True 
+        ).execute()
+        
+        return file.get('webViewLink'), None
+    except Exception as e:
+        # Trả về lỗi dạng chuỗi để hiển thị thông báo
+        error_msg = str(e)
+        if "Service Accounts do not have storage quota" in error_msg:
+            return None, "Lỗi Quota: Robot không có dung lượng lưu trữ cá nhân (Policy của Google). Hãy dùng Shared Drive."
+        return None, error_msg
 
 # ==========================================
-# 3. CSS ĐỘNG & XỬ LÝ GIAO DIỆN
+# 3. CSS & GIAO DIỆN
 # ==========================================
 comp = get_company_data()
+if comp is None:
+    comp = {'name': 'Tên Công Ty', 'address': '...', 'phone': '...', 'logo': None}
 
 st.markdown("""
 <style>
-    /* 1. Thiết lập chung */
-    .stApp { 
-        background-color: var(--background-color);
-        color: var(--text-color);
-        font-family: 'Segoe UI', sans-serif;
-    }
-    
-    /* 2. Box tiền */
+    .stApp { background-color: var(--background-color); color: var(--text-color); font-family: 'Segoe UI', sans-serif; }
     .money-box { 
         background: linear-gradient(135deg, #1e7e34 0%, #28a745 100%) !important;
-        color: #ffffff !important;
-        padding: 20px; 
-        border-radius: 12px; 
-        box-shadow: 0 4px 15px rgba(40, 167, 69, 0.4); 
-        font-size: 1.2em;
-        font-weight: bold;
-        text-align: center;
-        border: none;
+        color: #ffffff !important; padding: 20px; border-radius: 12px; 
+        box-shadow: 0 4px 15px rgba(40, 167, 69, 0.4); font-size: 1.2em; font-weight: bold; text-align: center; border: none;
     }
-    
-    /* 3. Card báo cáo */
     .report-card, .login-container { 
         background-color: var(--secondary-background-color);
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        border-radius: 12px; 
-        padding: 20px; 
-        margin-bottom: 15px; 
-        color: var(--text-color) !important;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
-        transition: transform 0.2s; 
+        border: 1px solid rgba(128, 128, 128, 0.2); border-radius: 12px; padding: 20px; margin-bottom: 15px; 
+        color: var(--text-color) !important; box-shadow: 0 2px 4px rgba(0,0,0,0.1); transition: transform 0.2s; 
     }
-    .report-card:hover { 
-        transform: translateY(-3px); 
-        border-color: #28a745; 
-        box-shadow: 0 6px 12px rgba(40, 167, 69, 0.2);
-    }
-    
-    .stButton button { 
-        border-radius: 8px; 
-        font-weight: 600; 
-        text-transform: uppercase; 
-        letter-spacing: 0.5px; 
-        transition: all 0.3s; 
-    }
-    
-    /* 4. Header công ty */
-    .company-header { 
-        display: flex; 
-        align-items: center; 
-        justify-content: center; 
-        gap: 25px; 
-        margin-bottom: 30px; 
-        border-bottom: 1px solid rgba(128, 128, 128, 0.2);
-        padding-bottom: 20px; 
-        background: transparent;
-        padding: 20px; 
-    }
+    .report-card:hover { transform: translateY(-3px); border-color: #28a745; box-shadow: 0 6px 12px rgba(40, 167, 69, 0.2); }
+    .stButton button { border-radius: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; transition: all 0.3s; }
+    .company-header { display: flex; align-items: center; justify-content: center; gap: 25px; margin-bottom: 30px; border-bottom: 1px solid rgba(128, 128, 128, 0.2); padding-bottom: 20px; background: transparent; padding: 20px; }
     .header-logo { border-radius: 10px; object-fit: contain; }
+    .login-container { max-width: 500px; margin: 0 auto; padding: 40px; text-align: center; }
+    .time-badge { background-color: var(--secondary-background-color); color: #28a745; padding: 4px 12px; border-radius: 20px; font-size: 0.85em; font-weight: bold; border: 1px solid #28a745; }
     
-    /* 5. Màn hình đăng nhập */
-    .login-container { 
-        max-width: 500px; 
-        margin: 0 auto; 
-        padding: 40px; 
-        text-align: center; 
-    }
-    
-    .time-badge { 
-        background-color: var(--secondary-background-color); 
-        color: #28a745; 
-        padding: 4px 12px; 
-        border-radius: 20px; 
-        font-size: 0.85em; 
-        font-weight: bold; 
-        border: 1px solid #28a745; 
-    }
-    iframe { border-radius: 10px; border: 1px solid rgba(128, 128, 128, 0.2); }
-
     h1, h2, h3, h4, h5, p, span, div, label { color: var(--text-color) !important; }
     .stAlert p, .stAlert div, .stAlert h4, .stAlert span { color: inherit !important; }
     .money-box b, .money-box div { color: #ffffff !important; }
     
-    /* 7. Ô NHẬP LIỆU */
-    .stTextInput input, .stNumberInput input { 
-        color: var(--text-color) !important; 
-        background-color: var(--secondary-background-color) !important;
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        border-radius: 8px;
-    }
-    .stTextInput input:focus, .stNumberInput input:focus {
-        border-color: #28a745 !important;
-        box-shadow: 0 0 0 1px #28a745;
-    }
+    .stTextInput input, .stNumberInput input { color: var(--text-color) !important; background-color: var(--secondary-background-color) !important; border: 1px solid rgba(128, 128, 128, 0.2); border-radius: 8px; }
+    .stTextInput input:focus, .stNumberInput input:focus { border-color: #28a745 !important; box-shadow: 0 0 0 1px #28a745; }
     
-    /* 8. DISABLE INPUT */
-    input:disabled, 
-    div[data-testid="stNumberInput"] input[disabled], 
-    div[data-testid="stTextInput"] input[disabled] {
-        opacity: 1 !important;
-        color: var(--text-color) !important;
-        -webkit-text-fill-color: var(--text-color) !important;
-        font-weight: bold !important;
-        cursor: not-allowed;
-        background-color: rgba(128, 128, 128, 0.1) !important;
-        border-color: rgba(128, 128, 128, 0.2) !important;
+    input:disabled, div[data-testid="stNumberInput"] input[disabled], div[data-testid="stTextInput"] input[disabled] {
+        opacity: 1 !important; color: var(--text-color) !important; -webkit-text-fill-color: var(--text-color) !important;
+        font-weight: bold !important; cursor: not-allowed; background-color: rgba(128, 128, 128, 0.1) !important; border-color: rgba(128, 128, 128, 0.2) !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -218,7 +264,8 @@ st.markdown("""
 # ==========================================
 def format_vnd(amount):
     if amount is None: return "0"
-    return "{:,.0f}".format(amount).replace(",", ".")
+    try: return "{:,.0f}".format(float(amount)).replace(",", ".")
+    except: return "0"
 
 def extract_numbers_from_line(line):
     raw_nums = re.findall(r'(?<!\d)(?!0\d)\d{1,3}(?:[.,]\d{3})+(?![.,]\d)', line)
@@ -230,7 +277,10 @@ def extract_pdf_data(uploaded_file, mode="normal"):
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages: text_content += (page.extract_text() or "") + "\n"
     except Exception as e: return None, f"Lỗi: {str(e)}"
-    info = {"date": "", "seller": "", "seller_tax": "", "buyer": "", "inv_num": "", "inv_sym": "", "pre_tax": 0.0, "tax": 0.0, "total": 0.0}
+    
+    all_found_numbers = set()
+    info = {"date": "", "seller": "", "seller_tax": "", "buyer": "", "inv_num": "", "inv_sym": "", "pre_tax": 0.0, "tax": 0.0, "total": 0.0, "all_numbers": []}
+    
     m_no = re.search(r'(?:Số hóa đơn|Số HĐ|Số|No)[:\s\.]*(\d{1,8})\b', text_content, re.IGNORECASE)
     if m_no: info["inv_num"] = m_no.group(1).zfill(7)
     m_sym = re.search(r'(?:Ký hiệu|Mẫu số|Serial)[:\s\.]*([A-Z0-9]{1,2}[A-Z0-9/-]{3,10})', text_content, re.IGNORECASE)
@@ -240,25 +290,32 @@ def extract_pdf_data(uploaded_file, mode="normal"):
     else:
         m_date_alt = re.search(r'(\d{2}/\d{2}/\d{4})', text_content)
         if m_date_alt: info["date"] = m_date_alt.group(1)
+    
     lines = text_content.split('\n')
     for line in lines:
         line_l = line.lower()
         nums = extract_numbers_from_line(line)
+        for n in nums: all_found_numbers.add(n)
         if not nums: continue
         val = max(nums)
         if any(kw in line_l for kw in ["thanh toán", "tổng cộng"]): info["total"] = val
         elif any(kw in line_l for kw in ["tiền hàng", "thành tiền"]): info["pre_tax"] = val
         elif "thuế" in line_l and "suất" not in line_l: info["tax"] = val
+        
     if mode == "deep" or info["total"] == 0:
         all_v = []
         for l in lines: all_v.extend(extract_numbers_from_line(l))
         if all_v: info["total"] = max(all_v)
+        
     if info["pre_tax"] == 0: info["pre_tax"] = round(info["total"] / 1.08)
     if info["tax"] == 0: info["tax"] = info["total"] - info["pre_tax"]
+    
     for line in lines[:35]:
         l_c = line.strip()
         if re.search(r'^(Đơn vị bán|Người bán|Bên A|Nhà cung cấp)', l_c, re.IGNORECASE): info["seller"] = l_c.split(':')[-1].strip()
         elif re.search(r'^(Đơn vị mua|Người mua|Khách hàng|Bên B)', l_c, re.IGNORECASE): info["buyer"] = l_c.split(':')[-1].strip()
+        
+    info["all_numbers"] = list(all_found_numbers) 
     return info, None
 
 # ==========================================
@@ -276,22 +333,19 @@ if not st.session_state.logged_in:
         try:
             token_str = base64.b64decode(st.query_params["token"]).decode()
             t_user, t_hash = token_str.split(":::")
-            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            c = conn.cursor()
-            c.execute("SELECT username, role, status FROM users WHERE username=? AND password=?", (t_user, t_hash))
-            user_db = c.fetchone()
-            conn.close()
-            if user_db and user_db[2] == 'approved':
+            sh = get_db()
+            ws = safe_get_worksheet(sh, 'users')
+            users = safe_get_all_records(ws)
+            user_db = next((u for u in users if u['username'] == t_user and u['password'] == t_hash), None)
+            if user_db and user_db['status'] == 'approved':
                 st.session_state.logged_in = True
-                st.session_state.user_info = {"name": user_db[0], "role": user_db[1]}
+                st.session_state.user_info = {"name": user_db['username'], "role": user_db['role']}
                 st.rerun()
-        except:
-            st.query_params.clear()
+        except: st.query_params.clear()
 
     col_a, col_b, col_c = st.columns([1, 2, 1])
     with col_b:
         st.write("")
-        logo_img = ""
         if comp['logo']:
             b64 = base64.b64encode(comp['logo']).decode()
             st.markdown(f'<div style="text-align:center;"><img src="data:image/png;base64,{b64}" height="120" class="header-logo"></div>', unsafe_allow_html=True)
@@ -303,49 +357,51 @@ if not st.session_state.logged_in:
             </div>
         """, unsafe_allow_html=True)
         
-        tab_login, tab_reg = st.tabs(["🔐 Đăng nhập hệ thống", "📝 Đăng ký nội bộ"])
-        
+        tab_login, tab_reg = st.tabs(["🔐 Đăng nhập", "📝 Đăng ký"])
         with tab_login:
             with st.form("login_form"):
                 u = st.text_input("Tài khoản")
                 p = st.text_input("Mật khẩu", type="password")
-                remember = st.checkbox("Lưu thông tin đăng nhập") 
-                
+                remember = st.checkbox("Lưu thông tin") 
                 if st.form_submit_button("XÁC NHẬN ĐĂNG NHẬP", use_container_width=True):
-                    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-                    c = conn.cursor()
-                    hashed_pw = hash_pass(p)
-                    c.execute("SELECT username, role, status FROM users WHERE username=? AND password=?", (u, hashed_pw))
-                    user = c.fetchone()
-                    conn.close()
-                    if user:
-                        if user[2] == 'approved':
-                            st.session_state.logged_in = True
-                            st.session_state.user_info = {"name": user[0], "role": user[1]}
-                            if remember:
-                                token_raw = f"{user[0]}:::{hashed_pw}"
-                                token_b64 = base64.b64encode(token_raw.encode()).decode()
-                                st.query_params["token"] = token_b64
-                            st.rerun()
-                        else: st.error("Tài khoản đang chờ duyệt!")
-                    else: st.error("Sai thông tin đăng nhập!")
-
+                    sh = get_db()
+                    ws = safe_get_worksheet(sh, 'users')
+                    if ws:
+                        hashed_pw = hash_pass(p)
+                        users = safe_get_all_records(ws)
+                        user = next((item for item in users if item["username"] == u and item["password"] == hashed_pw), None)
+                        if user:
+                            if user['status'] == 'approved':
+                                st.session_state.logged_in = True
+                                st.session_state.user_info = {"name": user['username'], "role": user['role']}
+                                if remember:
+                                    token_raw = f"{user['username']}:::{hashed_pw}"
+                                    token_b64 = base64.b64encode(token_raw.encode()).decode()
+                                    st.query_params["token"] = token_b64
+                                st.rerun()
+                            else: st.error("Tài khoản đang chờ duyệt!")
+                        else: st.error("Sai thông tin!")
+                    else: st.error("Lỗi kết nối CSDL!")
         with tab_reg:
             with st.form("reg_form"):
                 new_u = st.text_input("Tên tài khoản mới")
                 new_p = st.text_input("Mật khẩu", type="password")
-                if st.form_submit_button("GỬI YÊU CẦU ĐĂNG KÝ", use_container_width=True):
+                if st.form_submit_button("GỬI YÊU CẦU", use_container_width=True):
                     if new_u and new_p:
                         try:
-                            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-                            c = conn.cursor()
-                            c.execute("INSERT INTO users (username, password, role, status) VALUES (?, ?, 'user', 'pending')", (new_u, hash_pass(new_p)))
-                            conn.commit(); conn.close()
-                            st.success("Đã gửi! Chờ Admin duyệt nhé bé.")
-                        except: st.error("Tài khoản đã tồn tại!")
+                            sh = get_db()
+                            ws = safe_get_worksheet(sh, 'users')
+                            if ws:
+                                users = ws.col_values(2) 
+                                if new_u in users: st.error("Tài khoản đã tồn tại!")
+                                else:
+                                    new_id = get_next_id(ws)
+                                    ws.append_row([new_id, new_u, hash_pass(new_p), 'user', 'pending'])
+                                    st.success("Đã gửi! Chờ Admin duyệt.")
+                        except Exception as e: st.error(f"Lỗi: {e}")
     st.stop()
 
-# --- SIDEBAR & ADMIN PANEL ---
+# --- SIDEBAR ---
 with st.sidebar:
     if comp['logo']:
         b64 = base64.b64encode(comp['logo']).decode()
@@ -353,55 +409,54 @@ with st.sidebar:
     
     if st.session_state.user_info:
         st.success(f"Chào, **{st.session_state.user_info['name']}**")
+        
+        # --- HIỂN THỊ TRẠNG THÁI KẾT NỐI ---
+        with st.container():
+            st.markdown("---")
+            st.caption("📶 **TRẠNG THÁI KẾT NỐI**")
+            health = check_system_health()
+            if health['sheet']: st.markdown("✅ **Google Sheet:** Ổn định")
+            else: st.markdown("❌ **Google Sheet:** Mất kết nối")
+            
+            if health['drive']: st.markdown("✅ **Google Drive:** Đã kết nối API")
+            else: st.markdown("❌ **Google Drive:** Lỗi API")
+            st.markdown("---")
     
     if st.session_state.user_info and st.session_state.user_info['role'] == 'admin':
         with st.expander("⚙️ Quản trị hệ thống"):
             st.subheader("Duyệt thành viên")
-            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-            u_df = pd.read_sql("SELECT id, username, status FROM users WHERE role='user'", conn)
-            for _, row in u_df.iterrows():
-                col1, col2 = st.columns([2, 1])
-                col1.write(f"{row['username']} ({row['status']})")
-                if row['status'] == 'pending':
-                    if col2.button("Duyệt ✅", key=f"app_{row['id']}"):
-                        conn.execute("UPDATE users SET status='approved' WHERE id=?", (row['id'],)); conn.commit(); st.rerun()
-                else:
-                    if col2.button("Xóa 🗑️", key=f"delu_{row['id']}"):
-                        conn.execute("DELETE FROM users WHERE id=?", (row['id'],)); conn.commit(); st.rerun()
-            conn.close()
+            sh = get_db()
+            ws_users = safe_get_worksheet(sh, 'users')
+            if ws_users:
+                u_data = safe_get_all_records(ws_users)
+                u_df = pd.DataFrame(u_data)
+                if not u_df.empty:
+                    u_df = u_df[u_df['role'] == 'user']
+                    for _, row in u_df.iterrows():
+                        col1, col2 = st.columns([2, 1])
+                        col1.write(f"{row['username']} ({row['status']})")
+                        if row['status'] == 'pending':
+                            if col2.button("Duyệt", key=f"app_{row['id']}"):
+                                cell = ws_users.find(str(row['id']), in_column=1)
+                                ws_users.update_cell(cell.row, 5, 'approved') 
+                                st.rerun()
+                        else:
+                            if col2.button("Xóa", key=f"delu_{row['id']}"):
+                                cell = ws_users.find(str(row['id']), in_column=1)
+                                ws_users.delete_rows(cell.row)
+                                st.rerun()
             
             st.divider()
             st.subheader("Thông tin Công Ty")
             c_name = st.text_input("Tên Công ty:", value=comp['name'])
             c_addr = st.text_input("Địa chỉ:", value=comp['address'])
             c_phone = st.text_input("SĐT:", value=comp['phone'])
-            
             uploaded_logo = st.file_uploader("Tải Logo mới:", type=['png', 'jpg', 'jpeg'])
             if st.button("💾 Lưu cấu hình", use_container_width=True):
                 logo_data = uploaded_logo.read() if uploaded_logo else comp['logo']
                 update_company_info(c_name, c_addr, c_phone, logo_data)
                 st.success("Đã cập nhật!"); st.rerun()
 
-            st.divider()
-            st.subheader("⚠️ Quản lý dữ liệu (Nguy hiểm)")
-            with st.popover("🗑️ XÓA TOÀN BỘ HÓA ĐƠN"):
-                st.warning("CẢNH BÁO: Hành động này sẽ xóa sạch toàn bộ hóa đơn và liên kết dự án! Không thể hoàn tác.")
-                confirm_del = st.text_input("Nhập 'DELETE' để xác nhận:", key="admin_reset_confirm")
-                if st.button("XÁC NHẬN XÓA SẠCH", type="primary", disabled=(confirm_del != "DELETE")):
-                    try:
-                        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-                        conn.execute("DELETE FROM invoices")
-                        conn.execute("DELETE FROM project_links")
-                        conn.execute("DELETE FROM sqlite_sequence WHERE name='invoices'")
-                        conn.execute("DELETE FROM sqlite_sequence WHERE name='project_links'")
-                        conn.commit()
-                        conn.close()
-                        st.success("Đã xóa toàn bộ dữ liệu!")
-                        time.sleep(1)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Lỗi: {str(e)}")
-    
     if st.button("🚪 Đăng xuất", use_container_width=True):
         st.session_state.logged_in = False
         st.query_params.clear() 
@@ -409,7 +464,6 @@ with st.sidebar:
     st.divider()
     menu = st.radio("CHỨC NĂNG CHÍNH", ["1. Nhập Hóa Đơn", "2. Liên Kết Dự Án", "3. Báo Cáo Tổng Hợp"])
 
-# Nội dung Header chính
 logo_h = ""
 if comp['logo']:
     base64_l = base64.b64encode(comp['logo']).decode()
@@ -425,7 +479,7 @@ if "uploader_key" not in st.session_state: st.session_state.uploader_key = 0
 if menu == "1. Nhập Hóa Đơn":
     uploaded_file = st.file_uploader("📤 Kéo thả file hóa đơn PDF vào đây", type=["pdf"], key=f"up_{st.session_state.uploader_key}")
     
-    show_pdf = st.checkbox("👁️ Hiển thị file PDF (Bật/Tắt)", value=True)
+    show_pdf = st.checkbox("👁️ Hiển thị file PDF", value=True)
     
     if uploaded_file:
         if show_pdf:
@@ -436,33 +490,40 @@ if menu == "1. Nhập Hóa Đơn":
 
         if show_pdf and col_pdf:
             with col_pdf:
-                b64_pdf = base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
-                st.markdown(f'<iframe src="data:application/pdf;base64,{b64_pdf}" width="100%" height="800"></iframe>', unsafe_allow_html=True)
+                try:
+                    with pdfplumber.open(uploaded_file) as pdf:
+                        st.info(f"📄 File có {len(pdf.pages)} trang:")
+                        for i, page in enumerate(pdf.pages):
+                            im = page.to_image(resolution=150)
+                            st.image(im.original, caption=f"Trang {i+1}", use_container_width=True)
+                except Exception as e:
+                    st.error(f"Lỗi hiển thị preview: {e}")
+                    st.download_button("📥 Tải PDF về xem", data=uploaded_file.getvalue(), file_name=uploaded_file.name)
         
         with col_form:
             if st.button("🔍 Bước 2: PHÂN TÍCH FILE", type="primary", use_container_width=True):
                 data, _ = extract_pdf_data(uploaded_file)
-                # LẤY TÊN FILE LÀM TÊN GỢI NHỚ MẶC ĐỊNH
                 data['file_name'] = uploaded_file.name 
                 st.session_state.pdf_data = data; st.session_state.edit_lock = True; st.session_state.local_edit_count = 0
                 
-                # CHECK TIỀN NGAY KHI SOI
                 calc = data['pre_tax'] + data['tax']
                 diff = abs(data['total'] - calc)
                 if diff < 10: 
-                    st.success(f"✅ Tiền nong chuẩn chỉ! Tuyệt vời ông mặt trời 🌞 (Tổng: {format_vnd(data['total'])})")
+                    st.success(f"✅ Tiền nong chuẩn chỉ! (Tổng: {format_vnd(data['total'])})")
                 else: 
-                    st.warning(f"⚠️ Ôi không, tiền bị lệch {format_vnd(diff)}đ rồi! bé kiểm tra lại nha 🧐💸 (File: {format_vnd(data['total'])} - Máy tính: {format_vnd(calc)})")
+                    st.warning(f"⚠️ Cảnh báo lệch tiền: {format_vnd(diff)}đ")
 
             if st.session_state.pdf_data:
                 data = st.session_state.pdf_data
-                
-                # --- PHẦN FORM NHẬP LIỆU ---
+                all_nums = data.get('all_numbers', [])
+
+                def check_exist(val):
+                    if val in all_nums: return "✅ Có trong file"
+                    return "⚠️ Không tìm thấy!"
+
                 with st.form("invoice_form"):
                     inv_t = st.radio("Loại:", ["Đầu vào", "Đầu ra"], horizontal=True)
-                    # SỬ DỤNG TÊN FILE LÀM GIÁ TRỊ MẶC ĐỊNH
                     memo = st.text_input("📝 Tên gợi nhớ:", value=data.get('file_name', ''), placeholder="Ví dụ: Tiền cát, Tiếp khách...")
-                    
                     i_date = st.text_input("Ngày HĐ", value=data['date'])
                     cn, cs = st.columns(2)
                     with cn: i_num = st.text_input("Số HĐ", value=data['inv_num'])
@@ -471,212 +532,245 @@ if menu == "1. Nhập Hóa Đơn":
                     seller = st.text_input("Bên Bán", value=data['seller'])
                     buyer = st.text_input("Bên Mua", value=data['buyer'])
                     
-                    # Ô nhập tiền
-                    new_pre = st.number_input("Tiền hàng", value=float(data['pre_tax']), disabled=st.session_state.edit_lock, format="%.0f")
-                    new_tax = st.number_input("VAT", value=float(data['tax']), disabled=st.session_state.edit_lock, format="%.0f")
+                    st.markdown("#### 💰 Kiểm tra Tiền")
                     
-                    # Tự động cộng lại tiền khi render
+                    new_pre = st.number_input("Tiền hàng", value=float(data['pre_tax']), disabled=st.session_state.edit_lock, format="%.0f")
+                    if not st.session_state.edit_lock: st.caption(check_exist(new_pre))
+
+                    new_tax = st.number_input("VAT", value=float(data['tax']), disabled=st.session_state.edit_lock, format="%.0f")
+                    if not st.session_state.edit_lock: st.caption(check_exist(new_tax))
+                    
                     total_c = new_pre + new_tax
                     
-                    # CẢNH BÁO SỐ LẦN SỬA (MỚI THÊM)
                     if st.session_state.local_edit_count == 1:
-                        st.markdown('<div style="background-color:#ffeef7; color:#d63384; padding:10px; border-radius:5px; margin-bottom:10px; border: 1px solid #f8d7da;">🌸 <b>Lần sửa 1/2:</b> Cẩn thận nha bé ơi! Sắp hết lượt rồi đó.</div>', unsafe_allow_html=True)
+                        st.markdown('<div style="background-color:#ffeef7; color:#000000; padding:10px; border-radius:5px; margin-bottom:10px; border: 1px solid #f8d7da;">🌸 <b>Lần sửa 1/2:</b> Cẩn thận nha bé ơi!</div>', unsafe_allow_html=True)
                     elif st.session_state.local_edit_count == 2:
-                        st.markdown('<div style="background-color:#fff3cd; color:#856404; padding:10px; border-radius:5px; margin-bottom:10px; border: 1px solid #ffeeba;">🍊 <b>Lần sửa 2/2:</b> Hết lượt sửa rồi đó nha! Kiểm tra kỹ trước khi lưu nhé.</div>', unsafe_allow_html=True)
+                        st.markdown('<div style="background-color:#fff3cd; color:#000000; padding:10px; border-radius:5px; margin-bottom:10px; border: 1px solid #ffeeba;">🍊 <b>Lần sửa 2/2:</b> Hết lượt sửa rồi đó!</div>', unsafe_allow_html=True)
 
-                    # BOX TỔNG TIỀN VỚI TRẠNG THÁI CHECK KHỚP
                     is_match = abs(data['total'] - total_c) < 10
                     match_txt = "(Khớp lệnh! ✅)" if is_match else "(Chưa khớp đâu 🥺)"
                     st.markdown(f'<div class="money-box" style="text-align:center;">Tổng tính toán: <b>{format_vnd(total_c)}</b><br><span style="font-size:0.8em; color:white;">{match_txt}</span></div>', unsafe_allow_html=True)
                     
-                    # --- NÚT ĐIỀU KHIỂN ---
+                    if not st.session_state.edit_lock:
+                        if "✅" in check_exist(total_c): st.success(f"Tổng tiền khớp trong file PDF.")
+                        else: st.warning(f"Lưu ý: Tổng tiền không tìm thấy trong file.")
+
                     c1, c2 = st.columns(2)
                     with c1:
-                        # Nút mở khóa sửa - CÓ GIỚI HẠN 2 LẦN
                         if st.form_submit_button("✏️ Chỉnh sửa giá"):
-                            if st.session_state.local_edit_count >= 2:
-                                st.error("🚫 Hết lượt chỉnh sửa rồi bé ơi! (Quy định max 2 lần thui)")
-                            else:
-                                st.session_state.edit_lock = False; st.rerun()
+                            if st.session_state.local_edit_count >= 2: st.error("🚫 Hết lượt chỉnh sửa rồi!")
+                            else: st.session_state.edit_lock = False; st.rerun()
                     with c2:
-                        # Nút Xác nhận khớp giá - CHỈ HIỆN KHI ĐANG MỞ KHÓA SỬA
                         if not st.session_state.edit_lock:
                             if st.form_submit_button("✅ Xác nhận khớp giá"):
-                                # Check cộng lại tiền: Cập nhật lại total trong session_state data để đảm bảo nhất quán
                                 st.session_state.pdf_data['pre_tax'] = new_pre
                                 st.session_state.pdf_data['tax'] = new_tax
-                                st.session_state.pdf_data['total'] = total_c # Tổng tiền = Tiền hàng + VAT
+                                st.session_state.pdf_data['total'] = total_c 
                                 st.session_state.edit_lock = True
                                 st.session_state.local_edit_count += 1
                                 st.rerun()
 
+                    # --- LƯU DỮ LIỆU & UPLOAD DRIVE (CƠ CHẾ LỖI MỀM) ---
                     if st.form_submit_button("💾 LƯU DỮ LIỆU", type="primary", use_container_width=True):
-                        if not i_date or not i_num or not i_sym: st.error("Úi, bé quên nhập thông tin rồi! 🥺")
-                        elif not st.session_state.edit_lock: st.warning("Bấm nút 'Xác nhận khớp giá' để chốt đơn đã nhé! 🔒✨")
+                        if not i_date or not i_num or not i_sym: st.error("Úi, thiếu thông tin rồi! 🥺")
+                        elif not st.session_state.edit_lock: st.warning("Bấm nút 'Xác nhận khớp giá' trước đã! 🔒")
                         else:
-                            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-                            # Lưu total_c (đã cộng lại) thay vì data['total'] cũ
-                            conn.execute('INSERT INTO invoices (type, date, invoice_number, invoice_symbol, seller_name, buyer_name, pre_tax_amount, tax_amount, total_amount, edit_count, status, memo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-                                         ('OUT' if "Đầu ra" in inv_t else 'IN', i_date, i_num, i_sym, seller, buyer, new_pre, new_tax, total_c, st.session_state.local_edit_count, 'active', memo))
-                            conn.commit(); conn.close(); st.session_state.pdf_data = None; st.session_state.uploader_key += 1; st.rerun()
+                            with st.spinner('Đang xử lý...'):
+                                # 1. Cố gắng Upload Drive
+                                drive_link = ""
+                                if uploaded_file:
+                                    uploaded_file.seek(0)
+                                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                    final_filename = f"{ts}_{uploaded_file.name}"
+                                    link, err_msg = upload_to_drive(uploaded_file, final_filename)
+                                    
+                                    if link: 
+                                        drive_link = link
+                                        st.toast("Upload Drive thành công! ☁️")
+                                    else:
+                                        # NẾU LỖI: CHỈ HIỆN CẢNH BÁO, KHÔNG DỪNG CHƯƠNG TRÌNH
+                                        st.warning(f"⚠️ {err_msg}")
+                                        st.info("💡 Dữ liệu vẫn sẽ được lưu vào Sheet (chỉ thiếu link file).")
+
+                                # 2. Lưu vào Sheet (Luôn chạy)
+                                try:
+                                    sh = get_db()
+                                    ws = safe_get_worksheet(sh, 'invoices')
+                                    new_id = get_next_id(ws)
+                                    row_data = [new_id, 'OUT' if "Đầu ra" in inv_t else 'IN', '', i_date, i_num, i_sym, seller, '', buyer, new_pre, new_tax, total_c, '', 'active', st.session_state.local_edit_count, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), memo, drive_link]
+                                    ws.append_row(row_data)
+                                    st.success("Đã lưu vào Google Sheet thành công! ✅")
+                                    time.sleep(1.5)
+                                    st.session_state.pdf_data = None; st.session_state.uploader_key += 1; st.rerun()
+                                except Exception as e: st.error(f"Lỗi lưu Sheet: {e}")
 
     st.divider()
     with st.expander("🗑️ Lịch sử & Hủy Hóa Đơn", expanded=True):
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        # THÊM CỘT edit_count VÀO SQL
-        df = pd.read_sql("SELECT id, type, memo, invoice_number, total_amount, status, edit_count FROM invoices ORDER BY id DESC LIMIT 15", conn)
+        sh = get_db()
+        ws = safe_get_worksheet(sh, 'invoices')
+        data = safe_get_all_records(ws)
+        df = pd.DataFrame(data)
         if not df.empty:
+            df = df.sort_values(by='id', ascending=False).head(15)
             df['Tiền'] = df['total_amount'].apply(format_vnd)
-            # THÊM CỘT CẢNH BÁO SỬA
             df['Trạng thái sửa'] = df['edit_count'].apply(lambda x: f"⚠️ Sửa {x} lần" if x > 0 else "Gốc")
 
             def style_table(row):
-                # Ưu tiên màu xóa trước
-                if row.status == 'deleted': return ['background-color: #5c0e0e; color: #ff9999'] * len(row)
-                
-                # Cảnh báo sửa trong lịch sử
-                if row['edit_count'] == 1:
-                    return ['background-color: #ffeef7; color: #d63384'] * len(row) # Màu hồng
-                elif row['edit_count'] >= 2:
-                    return ['background-color: #fff3cd; color: #856404'] * len(row) # Màu cam
-                
+                if row.get('status') == 'deleted': return ['background-color: #5c0e0e; color: #ff9999'] * len(row)
+                try:
+                    ec = row['edit_count']
+                    if ec == 1: return ['background-color: #ffeef7; color: #000000'] * len(row) 
+                    elif ec >= 2: return ['background-color: #fff3cd; color: #000000'] * len(row)
+                except: pass
                 return [''] * len(row)
             
-            st.dataframe(df.style.apply(style_table, axis=1), use_container_width=True)
+            cols_show = ['id', 'type', 'memo', 'invoice_number', 'Tiền', 'status', 'drive_url', 'Trạng thái sửa', 'edit_count']
+            st.dataframe(
+                df[cols_show].style.apply(style_table, axis=1), 
+                column_config={
+                    "drive_url": st.column_config.LinkColumn("File", display_text="Xem"),
+                    "edit_count": None
+                },
+                use_container_width=True
+            )
             
             if st.session_state.user_info['role'] == 'admin':
                 a_ids = df[df['status'] == 'active']['id'].tolist()
                 if a_ids:
                     c_s, c_b = st.columns([3, 1])
-                    d_id = c_s.selectbox("ID cần hủy:", a_ids)
+                    d_id = c_s.selectbox("ID hủy:", a_ids)
                     if c_b.button("❌ Hủy", type="primary"):
-                        conn.execute("UPDATE invoices SET status='deleted' WHERE id=?", (d_id,))
-                        conn.execute("DELETE FROM project_links WHERE invoice_id=?", (d_id,))
-                        conn.commit(); st.rerun()
-        conn.close()
+                        cell = ws.find(str(d_id), in_column=1)
+                        ws.update_cell(cell.row, 14, 'deleted')
+                        st.rerun()
 
-# --- TAB 2: LIÊN KẾT DỰ ÁN ---
+# --- TAB 2 & 3: GIỮ NGUYÊN ---
 elif menu == "2. Liên Kết Dự Án":
-    if "edit_mode" not in st.session_state: st.session_state.edit_mode = False
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    sh = get_db()
+    ws_proj = safe_get_worksheet(sh, 'projects')
+    projs = safe_get_all_records(ws_proj)
+    df_projs = pd.DataFrame(projs)
     
-    # Khu vực Quản lý Dự Án
     st.subheader("📁 Quản Lý Dự Án")
     c_list, c_act = st.columns([2, 1])
-    
     with c_list:
-        projs = pd.read_sql("SELECT * FROM projects ORDER BY id DESC", conn)
-        p_opts = {r['project_name']: r['id'] for _, r in projs.iterrows()}
-        sel_p = st.selectbox("Chọn Dự Án làm việc:", list(p_opts.keys()) if p_opts else [], key="main_project_select")
+        p_opts = {r['project_name']: r['id'] for _, r in df_projs.iterrows()} if not df_projs.empty else {}
+        sel_p = st.selectbox("Chọn Dự Án:", list(p_opts.keys()) if p_opts else [], key="main_p")
 
     with c_act:
-        # Form Tạo dự án mới (Dùng st.form clear_on_submit để sửa lỗi crash)
-        with st.popover("➕ Thêm / 🗑️ Xóa Dự án"):
-            st.markdown("### Tạo mới")
-            with st.form("create_proj_form", clear_on_submit=True):
-                new_p_input = st.text_input("Tên dự án mới:", placeholder="Nhập tên dự án...")
-                if st.form_submit_button("Tạo Dự Án Mới", type="primary", use_container_width=True):
-                    if new_p_input:
-                        conn.execute("INSERT INTO projects (project_name) VALUES (?)", (new_p_input,))
-                        conn.commit(); st.rerun()
-                    else: st.warning("Chưa nhập tên kìa! 🥺")
-            
-            st.divider()
-            st.markdown("### Xóa dự án")
+        with st.popover("➕ Thêm / 🗑️ Xóa"):
+            with st.form("cr_p", clear_on_submit=True):
+                np = st.text_input("Tên dự án mới")
+                if st.form_submit_button("Tạo"):
+                    if np:
+                        nid = get_next_id(ws_proj)
+                        ws_proj.append_row([nid, np, datetime.now().strftime("%Y-%m-%d")])
+                        st.rerun()
             if p_opts:
-                p_to_del = st.selectbox("Chọn dự án muốn xóa:", list(p_opts.keys()), key="del_proj_select")
-                if st.button("❌ Xác nhận Xóa", type="primary", use_container_width=True):
+                del_p = st.selectbox("Xóa dự án:", list(p_opts.keys()))
+                if st.button("Xóa"):
                     if st.session_state.user_info['role'] == 'admin':
-                        pid_del = p_opts[p_to_del]
-                        conn.execute("DELETE FROM projects WHERE id=?", (pid_del,))
-                        conn.execute("DELETE FROM project_links WHERE project_id=?", (pid_del,))
-                        conn.commit(); st.rerun()
-                    else: st.error("Chỉ Admin mới được xóa thôi nha!")
+                        pid = p_opts[del_p]
+                        cell = ws_proj.find(str(pid), in_column=1)
+                        ws_proj.delete_rows(cell.row)
+                        st.rerun()
+                    else: st.error("Cần quyền Admin")
 
     if sel_p:
         pid = p_opts[sel_p]
-        st.divider()
-        st.write(f"Đang liên kết cho: **{sel_p}**")
-        
+        if "edit_mode" not in st.session_state: st.session_state.edit_mode = False
         if not st.session_state.edit_mode:
             if st.button("✏️ Mở Khóa Liên Kết"): st.session_state.edit_mode = True; st.rerun()
         else:
             if st.button("💾 LƯU THAY ĐỔI", type="primary"): st.session_state.trigger_save = True
 
-        all_l = pd.read_sql("SELECT * FROM project_links", conn)
-        blocked = all_l[all_l['project_id'] != pid]['invoice_id'].tolist()
-        mine = all_l[all_l['project_id'] == pid]['invoice_id'].tolist()
-        invs = pd.read_sql("SELECT * FROM invoices WHERE status='active' ORDER BY date DESC", conn)
-        avail = invs[~invs['id'].isin(blocked)].copy()
-        if not avail.empty:
-            avail['Đã chọn'] = avail['id'].isin(mine)
-            avail['Tiền'] = avail['total_amount'].apply(format_vnd)
-            avail['Tên hóa đơn'] = avail['memo'].fillna('') + " (" + avail['invoice_number'] + ")"
-            df_in = avail[avail['type'] == 'IN'][['Đã chọn', 'id', 'Tên hóa đơn', 'Tiền']]
-            df_out = avail[avail['type'] == 'OUT'][['Đã chọn', 'id', 'Tên hóa đơn', 'Tiền']]
-            dis = ["Tên hóa đơn", "Tiền"]; 
-            if not st.session_state.edit_mode: dis.append("Đã chọn")
-            cl, cr = st.columns(2)
-            with cl:
-                st.warning("💸 Hóa đơn Đầu vào") 
-                ed_in = st.data_editor(df_in, column_config={"Đã chọn": st.column_config.CheckboxColumn(required=True), "id": None}, disabled=dis, hide_index=True, key="ed_in")
-            with cr:
-                st.info("💰 Hóa đơn Đầu ra") 
-                ed_out = st.data_editor(df_out, column_config={"Đã chọn": st.column_config.CheckboxColumn(required=True), "id": None}, disabled=dis, hide_index=True, key="ed_out")
-            if st.session_state.get("trigger_save", False):
-                ids = ed_in[ed_in['Đã chọn']]['id'].tolist() + ed_out[ed_out['Đã chọn']]['id'].tolist()
-                conn.execute("DELETE FROM project_links WHERE project_id=?", (pid,))
-                if ids: conn.executemany("INSERT INTO project_links (project_id, invoice_id) VALUES (?,?)", [(pid, i) for i in ids])
-                conn.commit(); st.session_state.edit_mode = False; st.session_state.trigger_save = False; st.rerun()
-    conn.close()
+        ws_links = safe_get_worksheet(sh, 'project_links')
+        links = safe_get_all_records(ws_links)
+        ws_inv = safe_get_worksheet(sh, 'invoices')
+        invs = safe_get_all_records(ws_inv)
+        df_invs = pd.DataFrame(invs)
+        
+        if not df_invs.empty:
+            df_invs = df_invs[df_invs['status'] == 'active'].sort_values(by='date', ascending=False)
+            mine = [l['invoice_id'] for l in links if l['project_id'] == pid]
+            blocked = [l['invoice_id'] for l in links if l['project_id'] != pid]
+            avail = df_invs[~df_invs['id'].isin(blocked)].copy()
+            
+            avail['Selected'] = avail['id'].isin(mine)
+            avail['Money'] = avail['total_amount'].apply(format_vnd)
+            avail['Name'] = avail['memo'].fillna('') + " (" + avail['invoice_number'].astype(str) + ")"
+            
+            c1, c2 = st.columns(2)
+            disabled = not st.session_state.edit_mode
+            
+            with c1:
+                st.warning("Đầu vào")
+                df_in = avail[avail['type'] == 'IN'][['Selected', 'id', 'Name', 'Money']]
+                ed_in = st.data_editor(df_in, column_config={"Selected": st.column_config.CheckboxColumn(required=True), "id": None}, disabled=["Name", "Money"] if not disabled else ["Selected", "Name", "Money"], hide_index=True, key="edin")
+            with c2:
+                st.info("Đầu ra")
+                df_out = avail[avail['type'] == 'OUT'][['Selected', 'id', 'Name', 'Money']]
+                ed_out = st.data_editor(df_out, column_config={"Selected": st.column_config.CheckboxColumn(required=True), "id": None}, disabled=["Name", "Money"] if not disabled else ["Selected", "Name", "Money"], hide_index=True, key="edout")
 
-# --- TAB 3: BÁO CÁO ---
+            if st.session_state.get("trigger_save"):
+                ids = []
+                if not ed_in.empty: ids.extend(ed_in[ed_in['Selected']]['id'].tolist())
+                if not ed_out.empty: ids.extend(ed_out[ed_out['Selected']]['id'].tolist())
+                
+                # Xóa cũ
+                all_l = safe_get_all_records(ws_links)
+                to_del = [i+2 for i, l in enumerate(all_l) if l['project_id'] == pid]
+                for r in sorted(to_del, reverse=True): ws_links.delete_rows(r)
+                
+                # Thêm mới
+                if ids:
+                    nid = get_next_id(ws_links)
+                    new_r = [[nid+i, pid, iid] for i, iid in enumerate(ids)]
+                    ws_links.append_rows(new_r)
+                
+                st.session_state.edit_mode = False
+                st.session_state.trigger_save = False
+                st.rerun()
+
 elif menu == "3. Báo Cáo Tổng Hợp":
     st.title("📊 Báo Cáo Tài Chính")
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    query = '''
-        SELECT p.project_name, i.type, i.total_amount, i.date, i.memo
-        FROM projects p 
-        LEFT JOIN project_links pl ON p.id = pl.project_id
-        LEFT JOIN invoices i ON pl.invoice_id = i.id 
-        WHERE i.status = 'active' OR i.status IS NULL
-    '''
-    raw_df = pd.read_sql(query, conn); conn.close()
-    if not raw_df.empty:
-        raw_df['date_dt'] = pd.to_datetime(raw_df['date'], format='%d/%m/%Y', errors='coerce')
-        project_time_map = raw_df[raw_df['type'] == 'OUT'].groupby('project_name')['date_dt'].min().reset_index()
-        missing_p = raw_df[~raw_df['project_name'].isin(project_time_map['project_name'])]
-        if not missing_p.empty: project_time_map = pd.concat([project_time_map, missing_p.groupby('project_name')['date_dt'].min().reset_index()])
-        project_time_map['MonthYear'] = project_time_map['date_dt'].dt.strftime('%m/%Y')
-        project_time_map['SortKey'] = project_time_map['date_dt']
-        agg_df = raw_df.groupby(['project_name', 'type'])['total_amount'].sum().unstack(fill_value=0).reset_index()
-        if 'IN' not in agg_df: agg_df['IN'] = 0
-        if 'OUT' not in agg_df: agg_df['OUT'] = 0
-        final_report = pd.merge(agg_df, project_time_map[['project_name', 'MonthYear', 'SortKey']], on='project_name')
-        final_report['Lãi'] = final_report['OUT'] - final_report['IN']
-        final_report = final_report.sort_values(by='SortKey', ascending=False)
-        st.metric("TỔNG DOANH THU HỆ THỐNG", format_vnd(final_report['OUT'].sum()))
-        st.divider()
-        months = final_report['MonthYear'].unique()
-        for m in months:
-            st.markdown(f"### 📅 Tháng {m}")
-            m_data = final_report[final_report['MonthYear'] == m]
-            for _, r in m_data.iterrows():
+    sh = get_db()
+    df_p = pd.DataFrame(safe_get_all_records(safe_get_worksheet(sh, 'projects')))
+    df_l = pd.DataFrame(safe_get_all_records(safe_get_worksheet(sh, 'project_links')))
+    df_i = pd.DataFrame(safe_get_all_records(safe_get_worksheet(sh, 'invoices')))
+
+    if not df_p.empty and not df_l.empty and not df_i.empty:
+        m = pd.merge(df_p, df_l, left_on='id', right_on='project_id', suffixes=('_p', '_l'))
+        m = pd.merge(m, df_i, left_on='invoice_id', right_on='id')
+        m = m[m['status'] == 'active']
+        
+        if not m.empty:
+            m['date_dt'] = pd.to_datetime(m['date'], format='%d/%m/%Y', errors='coerce')
+            m['Month'] = m['date_dt'].dt.strftime('%m/%Y')
+            
+            agg = m.groupby(['project_name', 'type'])['total_amount'].sum().unstack(fill_value=0).reset_index()
+            if 'IN' not in agg: agg['IN'] = 0
+            if 'OUT' not in agg: agg['OUT'] = 0
+            agg['Lãi'] = agg['OUT'] - agg['IN']
+            
+            last_date = m.groupby('project_name')['date_dt'].max().reset_index()
+            agg = pd.merge(agg, last_date, on='project_name').sort_values('date_dt', ascending=False)
+
+            st.metric("TỔNG DOANH THU", format_vnd(agg['OUT'].sum()))
+            st.divider()
+            
+            for _, r in agg.iterrows():
                 with st.container():
                     st.markdown(f"""
                     <div class="report-card">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <h4 style="margin:0;">📂 {r['project_name']}</h4>
-                            <span class="time-badge">Thời gian: {m}</span>
-                        </div>
-                        <hr style="margin: 10px 0; border: 0; border-top: 1px solid #eee;">
-                        <div style="display: flex; gap: 40px;">
-                            <div><small style="opacity:0.8;">Doanh thu:</small><br><b style="font-size:1.2em;">{format_vnd(r['OUT'])}</b></div>
-                            <div><small style="opacity:0.8;">Chi phí:</small><br><b style="font-size:1.2em;">{format_vnd(r['IN'])}</b></div>
-                            <div style="color: {'#28a745' if r['Lãi'] >= 0 else '#dc3545'};">
-                                <small style="opacity:0.8; color:inherit;">Lãi ròng:</small><br><b style="font-size:1.2em; color:inherit;">{format_vnd(r['Lãi'])}</b>
-                            </div>
+                        <h4>📂 {r['project_name']}</h4>
+                        <hr style="margin: 5px 0;">
+                        <div style="display:flex; justify-content:space-between;">
+                            <div>Thu: <b>{format_vnd(r['OUT'])}</b></div>
+                            <div>Chi: <b>{format_vnd(r['IN'])}</b></div>
+                            <div style="color:{'#28a745' if r['Lãi']>=0 else 'red'}">Lãi: <b>{format_vnd(r['Lãi'])}</b></div>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
-    else: st.info("Chưa có dữ liệu báo cáo nào hết trơn á 🥺")
+        else: st.info("Chưa có dữ liệu.")
+    else: st.info("Chưa có dữ liệu.")
