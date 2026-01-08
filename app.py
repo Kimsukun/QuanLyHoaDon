@@ -9,7 +9,10 @@ import hashlib
 import sqlite3
 import os
 import shutil
-from PIL import Image # Thêm thư viện xử lý ảnh
+from PIL import Image
+import io
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
 
 # ==========================================
 # 1. CẤU HÌNH TRANG & KHỞI TẠO MÔI TRƯỜNG
@@ -106,16 +109,26 @@ def run_query(query, params=(), fetch_one=False, commit=False):
 def hash_pass(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
-def save_file_local(uploaded_file):
+def save_file_local(uploaded_file, is_converted_pdf=False, pdf_bytes=None):
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        clean_name = re.sub(r'[\\/*?:"<>|]', "", uploaded_file.name)
-        final_name = f"{ts}_{clean_name}"
-        file_path = os.path.join(UPLOAD_FOLDER, final_name)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        return file_path
-    except: return None
+        
+        if is_converted_pdf:
+            # Nếu là file PDF được convert từ ảnh
+            final_name = f"{ts}_converted_image.pdf"
+            file_path = os.path.join(UPLOAD_FOLDER, final_name)
+            with open(file_path, "wb") as f:
+                f.write(pdf_bytes)
+        else:
+            # File gốc
+            clean_name = re.sub(r'[\\/*?:"<>|]', "", uploaded_file.name)
+            final_name = f"{ts}_{clean_name}"
+            file_path = os.path.join(UPLOAD_FOLDER, final_name)
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+                
+        return file_path, final_name
+    except: return None, None
 
 def format_vnd(amount):
     if amount is None: return "0"
@@ -137,7 +150,7 @@ def update_company_info(name, address, phone, logo_bytes=None):
     st.cache_data.clear()
 
 # ==========================================
-# 3. CSS & XỬ LÝ FILE (PDF/IMAGE)
+# 3. CSS & XỬ LÝ FILE (PDF/IMAGE -> PDF)
 # ==========================================
 comp = get_company_data()
 st.markdown("""
@@ -168,27 +181,63 @@ def extract_numbers_from_line(line):
     raw_nums = re.findall(r'(?<!\d)(?!0\d)\d{1,3}(?:[.,]\d{3})+(?![.,]\d)', line)
     return [float(n.replace('.', '').replace(',', '')) for n in raw_nums if not (1990 <= float(n.replace('.', '').replace(',', '')) <= 2030)]
 
-def extract_data_smart(uploaded_file):
+# --- HÀM CHUYỂN ẢNH SANG PDF ---
+def convert_image_to_pdf(image_file):
+    try:
+        img = Image.open(image_file)
+        # Chuyển sang RGB nếu cần
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+            
+        img_width, img_height = img.size
+        
+        # Tạo PDF buffer
+        pdf_buffer = io.BytesIO()
+        c = canvas.Canvas(pdf_buffer, pagesize=(img_width, img_height))
+        
+        # Lưu ảnh tạm thời để vẽ vào PDF (reportlab cần đường dẫn file ảnh)
+        temp_img_path = f"temp_img_{int(time.time())}.jpg"
+        img.save(temp_img_path)
+        
+        c.drawImage(temp_img_path, 0, 0, img_width, img_height)
+        c.save()
+        
+        # Xóa ảnh tạm
+        if os.path.exists(temp_img_path):
+            os.remove(temp_img_path)
+            
+        pdf_buffer.seek(0)
+        return pdf_buffer
+    except Exception as e:
+        return None
+
+def extract_data_smart(file_obj, is_image=False):
     text_content = ""
-    # Xác định loại file
-    file_type = uploaded_file.type
+    msg = None
     
     try:
-        # Xử lý PDF
-        if "pdf" in file_type:
-            with pdfplumber.open(uploaded_file) as pdf:
-                for page in pdf.pages: text_content += (page.extract_text() or "") + "\n"
-        
-        # Xử lý Ảnh (Cần cài pytesseract, nếu không có sẽ trả về rỗng để nhập tay)
-        elif "image" in file_type:
-            try:
-                import pytesseract
-                image = Image.open(uploaded_file)
-                text_content = pytesseract.image_to_string(image, lang='vie') # Thử tiếng Việt
-            except:
-                return {"date": "", "seller": "", "buyer": "", "inv_num": "", "inv_sym": "", "pre_tax": 0.0, "tax": 0.0, "total": 0.0, "all_numbers": []}, "Cần nhập tay (Không có OCR)"
+        # Nếu là ảnh, convert sang PDF trước
+        pdf_file = file_obj
+        if is_image:
+            pdf_buffer = convert_image_to_pdf(file_obj)
+            if pdf_buffer:
+                pdf_file = pdf_buffer
+            else:
+                return None, "Lỗi chuyển đổi ảnh sang PDF"
 
-    except Exception as e: return None, f"Lỗi: {str(e)}"
+        # Dùng pdfplumber để đọc (hoạt động tốt với cả PDF gốc và PDF từ ảnh nếu ảnh rõ nét)
+        with pdfplumber.open(pdf_file) as pdf:
+            for page in pdf.pages: 
+                extracted = page.extract_text()
+                if extracted:
+                    text_content += extracted + "\n"
+        
+        # Nếu PDF (từ ảnh) mà không trích xuất được text -> Cần OCR (Tesseract)
+        # Ở đây ta giả định pdfplumber đọc được text cơ bản. Nếu không, trả về thông báo nhập tay.
+        if not text_content.strip():
+             return {"date": "", "seller": "", "buyer": "", "inv_num": "", "inv_sym": "", "pre_tax": 0.0, "tax": 0.0, "total": 0.0, "all_numbers": []}, "Không đọc được chữ từ file này. Vui lòng nhập tay."
+
+    except Exception as e: return None, f"Lỗi đọc file: {str(e)}"
     
     all_found_numbers = set()
     info = {"date": "", "seller": "", "buyer": "", "inv_num": "", "inv_sym": "", "pre_tax": 0.0, "tax": 0.0, "total": 0.0, "all_numbers": []}
@@ -224,7 +273,7 @@ def extract_data_smart(uploaded_file):
         elif re.search(r'^(Đơn vị mua|Người mua|Khách hàng|Bên B)', l_c, re.IGNORECASE): info["buyer"] = l_c.split(':')[-1].strip()
         
     info["all_numbers"] = list(all_found_numbers) 
-    return info, None
+    return info, msg
 
 # ==========================================
 # 4. GIAO DIỆN CHÍNH
@@ -326,6 +375,7 @@ if "pdf_data" not in st.session_state: st.session_state.pdf_data = None
 if "edit_lock" not in st.session_state: st.session_state.edit_lock = True
 if "local_edit_count" not in st.session_state: st.session_state.local_edit_count = 0
 if "uploader_key" not in st.session_state: st.session_state.uploader_key = 0
+if "uploaded_file_obj" not in st.session_state: st.session_state.uploaded_file_obj = None
 
 # --- TAB 1: NHẬP HÓA ĐƠN ---
 if menu == "1. Nhập Hóa Đơn":
@@ -333,6 +383,9 @@ if menu == "1. Nhập Hóa Đơn":
     show_pdf = st.checkbox("Xem File", value=True)
     
     if uploaded_file:
+        # Lưu file tạm vào session state để dùng khi lưu
+        st.session_state.uploaded_file_obj = uploaded_file
+        
         c_pdf, c_form = st.columns([1,1]) if show_pdf else (None, st.container())
         if show_pdf:
             with c_pdf:
@@ -350,7 +403,9 @@ if menu == "1. Nhập Hóa Đơn":
         
         with c_form:
             if st.button("🔍 PHÂN TÍCH", type="primary", use_container_width=True):
-                data, msg = extract_data_smart(uploaded_file)
+                is_img = "pdf" not in uploaded_file.type
+                data, msg = extract_data_smart(uploaded_file, is_image=is_img)
+                
                 if msg: st.warning(msg)
                 
                 data['file_name'] = uploaded_file.name
@@ -406,11 +461,25 @@ if menu == "1. Nhập Hóa Đơn":
                         if not date or not num: st.error("Thiếu ngày/số!")
                         elif not st.session_state.edit_lock: st.warning("Chốt giá trước!")
                         else:
-                            uploaded_file.seek(0)
-                            path = save_file_local(uploaded_file)
+                            # Xử lý lưu file (Nếu là ảnh thì convert sang PDF để lưu)
+                            f_obj = st.session_state.uploaded_file_obj
+                            f_obj.seek(0)
+                            
+                            is_img = "pdf" not in f_obj.type
+                            pdf_bytes = None
+                            if is_img:
+                                pdf_buffer = convert_image_to_pdf(f_obj)
+                                if pdf_buffer: pdf_bytes = pdf_buffer.getvalue()
+                            
+                            if is_img and pdf_bytes:
+                                # Lưu PDF đã convert
+                                path, final_name = save_file_local(f_obj, is_converted_pdf=True, pdf_bytes=pdf_bytes)
+                            else:
+                                # Lưu file gốc (PDF)
+                                path, final_name = save_file_local(f_obj)
+
                             if path:
                                 t = 'OUT' if "Đầu ra" in typ else 'IN'
-                                # Nếu bị khóa -> request_edit = 1, ngược lại = 0
                                 req_flag = 1 if is_locked_admin else 0
                                 
                                 run_query("""INSERT INTO invoices 
@@ -418,7 +487,7 @@ if menu == "1. Nhập Hóa Đơn":
                                 pre_tax_amount, tax_amount, total_amount, file_name, status, 
                                 edit_count, created_at, memo, file_path, drive_link, request_edit) 
                                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                          (t, date, num, sym, seller, buyer, pre, tax, total, uploaded_file.name, 
+                                          (t, date, num, sym, seller, buyer, pre, tax, total, final_name, 
                                            'active', st.session_state.local_edit_count, 
                                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), memo, path, drive_link, req_flag), commit=True)
                                 
@@ -426,11 +495,11 @@ if menu == "1. Nhập Hóa Đơn":
                                 else: st.success("Đã lưu thành công!")
                                 
                                 time.sleep(1)
-                                st.session_state.pdf_data = None; st.session_state.uploader_key += 1; st.rerun()
+                                st.session_state.pdf_data = None; st.session_state.uploader_key += 1; st.session_state.uploaded_file_obj = None; st.rerun()
 
     st.divider()
     with st.expander("Lịch sử", expanded=True):
-        # Lấy tất cả (kể cả xóa) để hiển thị, nhưng sắp xếp active lên trên nếu muốn
+        # Lấy tất cả (kể cả xóa) để hiển thị
         rows = run_query("SELECT * FROM invoices ORDER BY id DESC LIMIT 15")
         if rows:
             df = pd.DataFrame([dict(r) for r in rows])
@@ -439,13 +508,14 @@ if menu == "1. Nhập Hóa Đơn":
             for _, r in df.iterrows():
                 # Xử lý giao diện hàng xóa
                 bg_style = "deleted-row" if r['status'] == 'deleted' else "active-row"
+                req_msg = " | ⏳ Đang chờ duyệt sửa" if r.get('request_edit') == 1 else ""
                 
                 with st.container():
                     st.markdown(f"""
                         <div class="{bg_style}" style="display: flex; align-items: center; justify-content: space-between;">
                             <div style="flex:1"><b>#{r['id']}</b></div>
                             <div style="flex:1">{r['type']}</div>
-                            <div style="flex:3">{r['memo']} | {r['invoice_number']}</div>
+                            <div style="flex:3">{r['memo']} | {r['invoice_number']} {req_msg}</div>
                             <div style="flex:2; font-weight:bold;">{r['Tiền']}</div>
                             <div style="flex:1">{r['status']}</div>
                         </div>
