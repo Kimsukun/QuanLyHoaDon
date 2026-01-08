@@ -19,7 +19,7 @@ from gspread.exceptions import APIError
 st.set_page_config(page_title="Quản Lý Hóa Đơn Pro", page_icon="📑", layout="wide")
 
 # ==========================================
-# 2. KẾT NỐI GOOGLE SHEETS & DRIVE (CÓ CACHE)
+# 2. KẾT NỐI (CÓ CACHE & AN TOÀN)
 # ==========================================
 @st.cache_resource
 def get_creds():
@@ -32,73 +32,43 @@ def get_creds():
         creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         return creds
     except Exception as e:
-        st.error(f"Lỗi credentials: {e}. Hãy kiểm tra file secrets.toml")
+        st.error(f"Lỗi credentials: {e}. Kiểm tra secrets.toml")
         return None
 
 def get_gspread_client():
     creds = get_creds()
-    if creds:
-        return gspread.authorize(creds)
+    if creds: return gspread.authorize(creds)
     return None
 
 def get_drive_service():
     creds = get_creds()
-    if creds:
-        return build('drive', 'v3', credentials=creds)
+    if creds: return build('drive', 'v3', credentials=creds)
     return None
 
 def get_db():
     client = get_gspread_client()
     if client:
-        try:
-            return client.open_by_url(st.secrets["sheets"]["url"])
-        except Exception as e:
-            return None
+        try: return client.open_by_url(st.secrets["sheets"]["url"])
+        except: return None
     return None
-
-# --- HÀM KIỂM TRA KẾT NỐI ---
-def check_system_health():
-    status = {"sheet": False, "drive": False}
-    try:
-        sh = get_db()
-        if sh:
-            _ = sh.title 
-            status["sheet"] = True
-    except: pass
-
-    try:
-        service = get_drive_service()
-        if service:
-            # List thử 1 file để check quyền
-            service.files().list(pageSize=1).execute()
-            status["drive"] = True
-    except: pass
-    
-    return status
 
 # --- HÀM AN TOÀN CHỐNG QUOTA LIMIT (SHEET) ---
 def safe_get_worksheet(sh, title):
     max_retries = 3
     for i in range(max_retries):
-        try:
-            return sh.worksheet(title)
+        try: return sh.worksheet(title)
         except APIError as e:
-            if e.response.status_code == 429:
-                time.sleep((2 ** i) + 1)
-            else:
-                raise e
+            if e.response.status_code == 429: time.sleep((2 ** i) + 1)
+            else: raise e
     return None
 
 def safe_get_all_records(ws):
     max_retries = 3
     for i in range(max_retries):
-        try:
-            return ws.get_all_records()
+        try: return ws.get_all_records()
         except APIError as e:
-            if e.response.status_code == 429:
-                time.sleep((2 ** i) + 1)
-            else:
-                raise e
+            if e.response.status_code == 429: time.sleep((2 ** i) + 1)
+            else: raise e
     return []
 
 # --- KHỞI TẠO DB ---
@@ -180,43 +150,37 @@ def update_company_info(name, address, phone, logo_bytes=None):
         ws.update_cell(2, 5, b64_str)
     get_company_data.clear()
 
-# --- HÀM UPLOAD DRIVE (ĐÃ SỬA ĐỂ BẮT LỖI 403) ---
+# --- HÀM UPLOAD DRIVE (XỬ LÝ LỖI QUOTA) ---
 def upload_to_drive(file_obj, file_name):
     try:
         service = get_drive_service()
-        if not service: 
-            return None, "Không kết nối được dịch vụ Google Drive."
+        if not service: return None, "Mất kết nối API Drive"
         
         folder_id = None
-        try:
-            folder_id = st.secrets["drive"]["folder_id"]
-        except: 
-            return None, "Chưa cấu hình Folder ID trong secrets.toml"
+        try: folder_id = st.secrets["drive"]["folder_id"]
+        except: pass
 
         file_metadata = {'name': file_name}
-        if folder_id:
-            file_metadata['parents'] = [folder_id]
+        if folder_id: file_metadata['parents'] = [folder_id]
         
         file_content = file_obj.getvalue()
         buffer = BytesIO(file_content)
-        
         media = MediaIoBaseUpload(buffer, mimetype='application/pdf', resumable=True)
         
-        # Thêm supportsAllDrives=True để hỗ trợ Shared Drive nếu có
         file = service.files().create(
             body=file_metadata,
             media_body=media,
             fields='id, webViewLink',
             supportsAllDrives=True 
         ).execute()
-        
         return file.get('webViewLink'), None
+
     except Exception as e:
-        # Trả về lỗi dạng chuỗi để hiển thị thông báo
-        error_msg = str(e)
-        if "Service Accounts do not have storage quota" in error_msg:
-            return None, "Lỗi Quota: Robot không có dung lượng lưu trữ cá nhân (Policy của Google). Hãy dùng Shared Drive."
-        return None, error_msg
+        err_msg = str(e)
+        # Bắt lỗi Quota (0GB) của Robot
+        if "Service Accounts do not have storage quota" in err_msg or "storageQuotaExceeded" in err_msg:
+            return None, "QUOTA_ERROR"
+        return None, err_msg
 
 # ==========================================
 # 3. CSS & GIAO DIỆN
@@ -410,16 +374,14 @@ with st.sidebar:
     if st.session_state.user_info:
         st.success(f"Chào, **{st.session_state.user_info['name']}**")
         
-        # --- HIỂN THỊ TRẠNG THÁI KẾT NỐI ---
+        # --- CHECK KẾT NỐI (ẨN NẾU LỖI QUOTA) ---
         with st.container():
             st.markdown("---")
-            st.caption("📶 **TRẠNG THÁI KẾT NỐI**")
-            health = check_system_health()
-            if health['sheet']: st.markdown("✅ **Google Sheet:** Ổn định")
-            else: st.markdown("❌ **Google Sheet:** Mất kết nối")
-            
-            if health['drive']: st.markdown("✅ **Google Drive:** Đã kết nối API")
-            else: st.markdown("❌ **Google Drive:** Lỗi API")
+            try:
+                sh = get_db()
+                if sh: st.markdown("✅ **Database:** Đã kết nối")
+                else: st.markdown("❌ **Database:** Lỗi")
+            except: pass
             st.markdown("---")
     
     if st.session_state.user_info and st.session_state.user_info['role'] == 'admin':
@@ -570,14 +532,15 @@ if menu == "1. Nhập Hóa Đơn":
                                 st.session_state.local_edit_count += 1
                                 st.rerun()
 
-                    # --- LƯU DỮ LIỆU & UPLOAD DRIVE (CƠ CHẾ LỖI MỀM) ---
+                    # --- LƯU DỮ LIỆU & UPLOAD DRIVE (AUTO BYPASS QUOTA) ---
                     if st.form_submit_button("💾 LƯU DỮ LIỆU", type="primary", use_container_width=True):
                         if not i_date or not i_num or not i_sym: st.error("Úi, thiếu thông tin rồi! 🥺")
                         elif not st.session_state.edit_lock: st.warning("Bấm nút 'Xác nhận khớp giá' trước đã! 🔒")
                         else:
                             with st.spinner('Đang xử lý...'):
-                                # 1. Cố gắng Upload Drive
+                                # 1. Upload Drive (Thử vận may)
                                 drive_link = ""
+                                drive_msg = ""
                                 if uploaded_file:
                                     uploaded_file.seek(0)
                                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -586,21 +549,25 @@ if menu == "1. Nhập Hóa Đơn":
                                     
                                     if link: 
                                         drive_link = link
-                                        st.toast("Upload Drive thành công! ☁️")
+                                        drive_msg = "✅ Upload Drive OK"
+                                    elif err_msg == "QUOTA_ERROR":
+                                        drive_msg = "⚠️ Tài khoản Gmail cá nhân không hỗ trợ Robot Upload (Bỏ qua file)"
                                     else:
-                                        # NẾU LỖI: CHỈ HIỆN CẢNH BÁO, KHÔNG DỪNG CHƯƠNG TRÌNH
-                                        st.warning(f"⚠️ {err_msg}")
-                                        st.info("💡 Dữ liệu vẫn sẽ được lưu vào Sheet (chỉ thiếu link file).")
+                                        drive_msg = f"⚠️ Lỗi Drive: {err_msg}"
 
-                                # 2. Lưu vào Sheet (Luôn chạy)
+                                # 2. Lưu Sheet (Quan trọng nhất)
                                 try:
                                     sh = get_db()
                                     ws = safe_get_worksheet(sh, 'invoices')
                                     new_id = get_next_id(ws)
                                     row_data = [new_id, 'OUT' if "Đầu ra" in inv_t else 'IN', '', i_date, i_num, i_sym, seller, '', buyer, new_pre, new_tax, total_c, '', 'active', st.session_state.local_edit_count, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), memo, drive_link]
                                     ws.append_row(row_data)
-                                    st.success("Đã lưu vào Google Sheet thành công! ✅")
-                                    time.sleep(1.5)
+                                    
+                                    # Thông báo kết quả
+                                    st.success("Đã lưu dữ liệu vào Sheet thành công! 🎉")
+                                    if drive_msg: st.info(drive_msg)
+                                    
+                                    time.sleep(2)
                                     st.session_state.pdf_data = None; st.session_state.uploader_key += 1; st.rerun()
                                 except Exception as e: st.error(f"Lỗi lưu Sheet: {e}")
 
@@ -644,7 +611,7 @@ if menu == "1. Nhập Hóa Đơn":
                         ws.update_cell(cell.row, 14, 'deleted')
                         st.rerun()
 
-# --- TAB 2 & 3: GIỮ NGUYÊN ---
+# --- TAB 2: LIÊN KẾT DỰ ÁN ---
 elif menu == "2. Liên Kết Dự Án":
     sh = get_db()
     ws_proj = safe_get_worksheet(sh, 'projects')
