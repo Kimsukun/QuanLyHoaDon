@@ -10,16 +10,6 @@ import sqlite3
 import os
 import shutil
 from PIL import Image
-import pytesseract
-
-
-
-# CẤU HÌNH ĐƯỜNG DẪN (Bắt buộc đối với Windows)
-
-# Dấu r'' giúp Python hiểu đúng đường dẫn thư mục
-
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR'
-
 # ==========================================
 # CẤU HÌNH ĐƯỜNG DẪN TESSERACT (QUAN TRỌNG)
 # ==========================================
@@ -588,4 +578,5 @@ elif menu == "3. Báo Cáo Tổng Hợp":
                     """, unsafe_allow_html=True)
         else: st.info(f"Không có dữ liệu cho tháng {selected_month}")
     else: st.info("Chưa có dữ liệu.")
+
 
