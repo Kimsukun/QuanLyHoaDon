@@ -32,7 +32,8 @@ def get_creds():
         creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
         return creds
     except Exception as e:
-        st.error(f"Lỗi credentials: {e}. Kiểm tra secrets.toml")
+        # Không báo lỗi đỏ, chỉ log ra terminal để tránh vỡ giao diện
+        print(f"Lỗi credentials: {e}")
         return None
 
 def get_gspread_client():
@@ -52,23 +53,27 @@ def get_db():
         except: return None
     return None
 
-# --- HÀM AN TOÀN CHỐNG QUOTA LIMIT (SHEET) ---
+# --- HÀM AN TOÀN CHỐNG QUOTA LIMIT & NULL ---
 def safe_get_worksheet(sh, title):
+    if sh is None: return None # <--- FIX QUAN TRỌNG: Nếu không có kết nối thì trả về None ngay
     max_retries = 3
     for i in range(max_retries):
         try: return sh.worksheet(title)
         except APIError as e:
             if e.response.status_code == 429: time.sleep((2 ** i) + 1)
-            else: raise e
+            else: return None # Nếu lỗi khác (vd không tìm thấy sheet) thì bỏ qua
+        except: return None
     return None
 
 def safe_get_all_records(ws):
+    if ws is None: return [] # <--- FIX: Nếu worksheet không tồn tại thì trả về list rỗng
     max_retries = 3
     for i in range(max_retries):
         try: return ws.get_all_records()
         except APIError as e:
             if e.response.status_code == 429: time.sleep((2 ** i) + 1)
-            else: raise e
+            else: return []
+        except: return []
     return []
 
 # --- KHỞI TẠO DB ---
@@ -100,9 +105,10 @@ def init_db():
             else:
                 if table_name == 'invoices':
                     ws = safe_get_worksheet(sh, 'invoices')
-                    current_headers = ws.row_values(1)
-                    if 'drive_url' not in current_headers:
-                        ws.update_cell(1, len(current_headers) + 1, 'drive_url')
+                    if ws:
+                        current_headers = ws.row_values(1)
+                        if 'drive_url' not in current_headers:
+                            ws.update_cell(1, len(current_headers) + 1, 'drive_url')
     except: pass
 
 if 'db_initialized' not in st.session_state:
@@ -111,6 +117,7 @@ if 'db_initialized' not in st.session_state:
 
 # --- CÁC HÀM HỖ TRỢ KHÁC ---
 def get_next_id(worksheet):
+    if worksheet is None: return 1
     col_values = worksheet.col_values(1)
     if len(col_values) <= 1: return 1 
     try:
@@ -121,10 +128,13 @@ def get_next_id(worksheet):
 def hash_pass(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
+# --- FIX: Hàm lấy data công ty an toàn tuyệt đối ---
 @st.cache_data(ttl=600) 
 def get_company_data():
+    default_data = {'name': 'Tên Công Ty', 'address': '...', 'phone': '...', 'logo': None}
     sh = get_db()
-    if not sh: return None
+    if not sh: return pd.Series(default_data)
+    
     try:
         ws = safe_get_worksheet(sh, 'company_info')
         data = safe_get_all_records(ws)
@@ -136,12 +146,13 @@ def get_company_data():
                 row['logo'] = None
             return pd.Series(row)
     except: pass
-    return None
+    return pd.Series(default_data)
 
 def update_company_info(name, address, phone, logo_bytes=None):
     sh = get_db()
     if not sh: return
     ws = safe_get_worksheet(sh, 'company_info')
+    if not ws: return
     ws.update_cell(2, 2, name)
     ws.update_cell(2, 3, address)
     ws.update_cell(2, 4, phone)
@@ -150,7 +161,6 @@ def update_company_info(name, address, phone, logo_bytes=None):
         ws.update_cell(2, 5, b64_str)
     get_company_data.clear()
 
-# --- HÀM UPLOAD DRIVE (XỬ LÝ LỖI QUOTA) ---
 def upload_to_drive(file_obj, file_name):
     try:
         service = get_drive_service()
@@ -168,16 +178,12 @@ def upload_to_drive(file_obj, file_name):
         media = MediaIoBaseUpload(buffer, mimetype='application/pdf', resumable=True)
         
         file = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, webViewLink',
-            supportsAllDrives=True 
+            body=file_metadata, media_body=media, fields='id, webViewLink', supportsAllDrives=True 
         ).execute()
         return file.get('webViewLink'), None
 
     except Exception as e:
         err_msg = str(e)
-        # Bắt lỗi Quota (0GB) của Robot
         if "Service Accounts do not have storage quota" in err_msg or "storageQuotaExceeded" in err_msg:
             return None, "QUOTA_ERROR"
         return None, err_msg
@@ -185,9 +191,8 @@ def upload_to_drive(file_obj, file_name):
 # ==========================================
 # 3. CSS & GIAO DIỆN
 # ==========================================
+# Khởi tạo comp AN TOÀN ở cấp cao nhất
 comp = get_company_data()
-if comp is None:
-    comp = {'name': 'Tên Công Ty', 'address': '...', 'phone': '...', 'logo': None}
 
 st.markdown("""
 <style>
@@ -374,7 +379,6 @@ with st.sidebar:
     if st.session_state.user_info:
         st.success(f"Chào, **{st.session_state.user_info['name']}**")
         
-        # --- CHECK KẾT NỐI (ẨN NẾU LỖI QUOTA) ---
         with st.container():
             st.markdown("---")
             try:
@@ -575,169 +579,172 @@ if menu == "1. Nhập Hóa Đơn":
     with st.expander("🗑️ Lịch sử & Hủy Hóa Đơn", expanded=True):
         sh = get_db()
         ws = safe_get_worksheet(sh, 'invoices')
-        data = safe_get_all_records(ws)
-        df = pd.DataFrame(data)
-        if not df.empty:
-            df = df.sort_values(by='id', ascending=False).head(15)
-            df['Tiền'] = df['total_amount'].apply(format_vnd)
-            df['Trạng thái sửa'] = df['edit_count'].apply(lambda x: f"⚠️ Sửa {x} lần" if x > 0 else "Gốc")
+        if ws:
+            data = safe_get_all_records(ws)
+            df = pd.DataFrame(data)
+            if not df.empty:
+                df = df.sort_values(by='id', ascending=False).head(15)
+                df['Tiền'] = df['total_amount'].apply(format_vnd)
+                df['Trạng thái sửa'] = df['edit_count'].apply(lambda x: f"⚠️ Sửa {x} lần" if x > 0 else "Gốc")
 
-            def style_table(row):
-                if row.get('status') == 'deleted': return ['background-color: #5c0e0e; color: #ff9999'] * len(row)
-                try:
-                    ec = row['edit_count']
-                    if ec == 1: return ['background-color: #ffeef7; color: #000000'] * len(row) 
-                    elif ec >= 2: return ['background-color: #fff3cd; color: #000000'] * len(row)
-                except: pass
-                return [''] * len(row)
-            
-            cols_show = ['id', 'type', 'memo', 'invoice_number', 'Tiền', 'status', 'drive_url', 'Trạng thái sửa', 'edit_count']
-            st.dataframe(
-                df[cols_show].style.apply(style_table, axis=1), 
-                column_config={
-                    "drive_url": st.column_config.LinkColumn("File", display_text="Xem"),
-                    "edit_count": None
-                },
-                use_container_width=True
-            )
-            
-            if st.session_state.user_info['role'] == 'admin':
-                a_ids = df[df['status'] == 'active']['id'].tolist()
-                if a_ids:
-                    c_s, c_b = st.columns([3, 1])
-                    d_id = c_s.selectbox("ID hủy:", a_ids)
-                    if c_b.button("❌ Hủy", type="primary"):
-                        cell = ws.find(str(d_id), in_column=1)
-                        ws.update_cell(cell.row, 14, 'deleted')
-                        st.rerun()
+                def style_table(row):
+                    if row.get('status') == 'deleted': return ['background-color: #5c0e0e; color: #ff9999'] * len(row)
+                    try:
+                        ec = row['edit_count']
+                        if ec == 1: return ['background-color: #ffeef7; color: #000000'] * len(row) 
+                        elif ec >= 2: return ['background-color: #fff3cd; color: #000000'] * len(row)
+                    except: pass
+                    return [''] * len(row)
+                
+                cols_show = ['id', 'type', 'memo', 'invoice_number', 'Tiền', 'status', 'drive_url', 'Trạng thái sửa', 'edit_count']
+                st.dataframe(
+                    df[cols_show].style.apply(style_table, axis=1), 
+                    column_config={
+                        "drive_url": st.column_config.LinkColumn("File", display_text="Xem"),
+                        "edit_count": None
+                    },
+                    use_container_width=True
+                )
+                
+                if st.session_state.user_info['role'] == 'admin':
+                    a_ids = df[df['status'] == 'active']['id'].tolist()
+                    if a_ids:
+                        c_s, c_b = st.columns([3, 1])
+                        d_id = c_s.selectbox("ID hủy:", a_ids)
+                        if c_b.button("❌ Hủy", type="primary"):
+                            cell = ws.find(str(d_id), in_column=1)
+                            ws.update_cell(cell.row, 14, 'deleted')
+                            st.rerun()
 
 # --- TAB 2: LIÊN KẾT DỰ ÁN ---
 elif menu == "2. Liên Kết Dự Án":
     sh = get_db()
     ws_proj = safe_get_worksheet(sh, 'projects')
-    projs = safe_get_all_records(ws_proj)
-    df_projs = pd.DataFrame(projs)
-    
-    st.subheader("📁 Quản Lý Dự Án")
-    c_list, c_act = st.columns([2, 1])
-    with c_list:
-        p_opts = {r['project_name']: r['id'] for _, r in df_projs.iterrows()} if not df_projs.empty else {}
-        sel_p = st.selectbox("Chọn Dự Án:", list(p_opts.keys()) if p_opts else [], key="main_p")
-
-    with c_act:
-        with st.popover("➕ Thêm / 🗑️ Xóa"):
-            with st.form("cr_p", clear_on_submit=True):
-                np = st.text_input("Tên dự án mới")
-                if st.form_submit_button("Tạo"):
-                    if np:
-                        nid = get_next_id(ws_proj)
-                        ws_proj.append_row([nid, np, datetime.now().strftime("%Y-%m-%d")])
-                        st.rerun()
-            if p_opts:
-                del_p = st.selectbox("Xóa dự án:", list(p_opts.keys()))
-                if st.button("Xóa"):
-                    if st.session_state.user_info['role'] == 'admin':
-                        pid = p_opts[del_p]
-                        cell = ws_proj.find(str(pid), in_column=1)
-                        ws_proj.delete_rows(cell.row)
-                        st.rerun()
-                    else: st.error("Cần quyền Admin")
-
-    if sel_p:
-        pid = p_opts[sel_p]
-        if "edit_mode" not in st.session_state: st.session_state.edit_mode = False
-        if not st.session_state.edit_mode:
-            if st.button("✏️ Mở Khóa Liên Kết"): st.session_state.edit_mode = True; st.rerun()
-        else:
-            if st.button("💾 LƯU THAY ĐỔI", type="primary"): st.session_state.trigger_save = True
-
-        ws_links = safe_get_worksheet(sh, 'project_links')
-        links = safe_get_all_records(ws_links)
-        ws_inv = safe_get_worksheet(sh, 'invoices')
-        invs = safe_get_all_records(ws_inv)
-        df_invs = pd.DataFrame(invs)
+    if ws_proj:
+        projs = safe_get_all_records(ws_proj)
+        df_projs = pd.DataFrame(projs)
         
-        if not df_invs.empty:
-            df_invs = df_invs[df_invs['status'] == 'active'].sort_values(by='date', ascending=False)
-            mine = [l['invoice_id'] for l in links if l['project_id'] == pid]
-            blocked = [l['invoice_id'] for l in links if l['project_id'] != pid]
-            avail = df_invs[~df_invs['id'].isin(blocked)].copy()
-            
-            avail['Selected'] = avail['id'].isin(mine)
-            avail['Money'] = avail['total_amount'].apply(format_vnd)
-            avail['Name'] = avail['memo'].fillna('') + " (" + avail['invoice_number'].astype(str) + ")"
-            
-            c1, c2 = st.columns(2)
-            disabled = not st.session_state.edit_mode
-            
-            with c1:
-                st.warning("Đầu vào")
-                df_in = avail[avail['type'] == 'IN'][['Selected', 'id', 'Name', 'Money']]
-                ed_in = st.data_editor(df_in, column_config={"Selected": st.column_config.CheckboxColumn(required=True), "id": None}, disabled=["Name", "Money"] if not disabled else ["Selected", "Name", "Money"], hide_index=True, key="edin")
-            with c2:
-                st.info("Đầu ra")
-                df_out = avail[avail['type'] == 'OUT'][['Selected', 'id', 'Name', 'Money']]
-                ed_out = st.data_editor(df_out, column_config={"Selected": st.column_config.CheckboxColumn(required=True), "id": None}, disabled=["Name", "Money"] if not disabled else ["Selected", "Name", "Money"], hide_index=True, key="edout")
+        st.subheader("📁 Quản Lý Dự Án")
+        c_list, c_act = st.columns([2, 1])
+        with c_list:
+            p_opts = {r['project_name']: r['id'] for _, r in df_projs.iterrows()} if not df_projs.empty else {}
+            sel_p = st.selectbox("Chọn Dự Án:", list(p_opts.keys()) if p_opts else [], key="main_p")
 
-            if st.session_state.get("trigger_save"):
-                ids = []
-                if not ed_in.empty: ids.extend(ed_in[ed_in['Selected']]['id'].tolist())
-                if not ed_out.empty: ids.extend(ed_out[ed_out['Selected']]['id'].tolist())
+        with c_act:
+            with st.popover("➕ Thêm / 🗑️ Xóa"):
+                with st.form("cr_p", clear_on_submit=True):
+                    np = st.text_input("Tên dự án mới")
+                    if st.form_submit_button("Tạo"):
+                        if np:
+                            nid = get_next_id(ws_proj)
+                            ws_proj.append_row([nid, np, datetime.now().strftime("%Y-%m-%d")])
+                            st.rerun()
+                if p_opts:
+                    del_p = st.selectbox("Xóa dự án:", list(p_opts.keys()))
+                    if st.button("Xóa"):
+                        if st.session_state.user_info['role'] == 'admin':
+                            pid = p_opts[del_p]
+                            cell = ws_proj.find(str(pid), in_column=1)
+                            ws_proj.delete_rows(cell.row)
+                            st.rerun()
+                        else: st.error("Cần quyền Admin")
+
+        if sel_p:
+            pid = p_opts[sel_p]
+            if "edit_mode" not in st.session_state: st.session_state.edit_mode = False
+            if not st.session_state.edit_mode:
+                if st.button("✏️ Mở Khóa Liên Kết"): st.session_state.edit_mode = True; st.rerun()
+            else:
+                if st.button("💾 LƯU THAY ĐỔI", type="primary"): st.session_state.trigger_save = True
+
+            ws_links = safe_get_worksheet(sh, 'project_links')
+            links = safe_get_all_records(ws_links)
+            ws_inv = safe_get_worksheet(sh, 'invoices')
+            invs = safe_get_all_records(ws_inv)
+            df_invs = pd.DataFrame(invs)
+            
+            if not df_invs.empty:
+                df_invs = df_invs[df_invs['status'] == 'active'].sort_values(by='date', ascending=False)
+                mine = [l['invoice_id'] for l in links if l['project_id'] == pid]
+                blocked = [l['invoice_id'] for l in links if l['project_id'] != pid]
+                avail = df_invs[~df_invs['id'].isin(blocked)].copy()
                 
-                # Xóa cũ
-                all_l = safe_get_all_records(ws_links)
-                to_del = [i+2 for i, l in enumerate(all_l) if l['project_id'] == pid]
-                for r in sorted(to_del, reverse=True): ws_links.delete_rows(r)
+                avail['Selected'] = avail['id'].isin(mine)
+                avail['Money'] = avail['total_amount'].apply(format_vnd)
+                avail['Name'] = avail['memo'].fillna('') + " (" + avail['invoice_number'].astype(str) + ")"
                 
-                # Thêm mới
-                if ids:
-                    nid = get_next_id(ws_links)
-                    new_r = [[nid+i, pid, iid] for i, iid in enumerate(ids)]
-                    ws_links.append_rows(new_r)
+                c1, c2 = st.columns(2)
+                disabled = not st.session_state.edit_mode
                 
-                st.session_state.edit_mode = False
-                st.session_state.trigger_save = False
-                st.rerun()
+                with c1:
+                    st.warning("Đầu vào")
+                    df_in = avail[avail['type'] == 'IN'][['Selected', 'id', 'Name', 'Money']]
+                    ed_in = st.data_editor(df_in, column_config={"Selected": st.column_config.CheckboxColumn(required=True), "id": None}, disabled=["Name", "Money"] if not disabled else ["Selected", "Name", "Money"], hide_index=True, key="edin")
+                with c2:
+                    st.info("Đầu ra")
+                    df_out = avail[avail['type'] == 'OUT'][['Selected', 'id', 'Name', 'Money']]
+                    ed_out = st.data_editor(df_out, column_config={"Selected": st.column_config.CheckboxColumn(required=True), "id": None}, disabled=["Name", "Money"] if not disabled else ["Selected", "Name", "Money"], hide_index=True, key="edout")
+
+                if st.session_state.get("trigger_save"):
+                    ids = []
+                    if not ed_in.empty: ids.extend(ed_in[ed_in['Selected']]['id'].tolist())
+                    if not ed_out.empty: ids.extend(ed_out[ed_out['Selected']]['id'].tolist())
+                    
+                    # Xóa cũ
+                    all_l = safe_get_all_records(ws_links)
+                    to_del = [i+2 for i, l in enumerate(all_l) if l['project_id'] == pid]
+                    for r in sorted(to_del, reverse=True): ws_links.delete_rows(r)
+                    
+                    # Thêm mới
+                    if ids:
+                        nid = get_next_id(ws_links)
+                        new_r = [[nid+i, pid, iid] for i, iid in enumerate(ids)]
+                        ws_links.append_rows(new_r)
+                    
+                    st.session_state.edit_mode = False
+                    st.session_state.trigger_save = False
+                    st.rerun()
 
 elif menu == "3. Báo Cáo Tổng Hợp":
     st.title("📊 Báo Cáo Tài Chính")
     sh = get_db()
-    df_p = pd.DataFrame(safe_get_all_records(safe_get_worksheet(sh, 'projects')))
-    df_l = pd.DataFrame(safe_get_all_records(safe_get_worksheet(sh, 'project_links')))
-    df_i = pd.DataFrame(safe_get_all_records(safe_get_worksheet(sh, 'invoices')))
+    if sh:
+        df_p = pd.DataFrame(safe_get_all_records(safe_get_worksheet(sh, 'projects')))
+        df_l = pd.DataFrame(safe_get_all_records(safe_get_worksheet(sh, 'project_links')))
+        df_i = pd.DataFrame(safe_get_all_records(safe_get_worksheet(sh, 'invoices')))
 
-    if not df_p.empty and not df_l.empty and not df_i.empty:
-        m = pd.merge(df_p, df_l, left_on='id', right_on='project_id', suffixes=('_p', '_l'))
-        m = pd.merge(m, df_i, left_on='invoice_id', right_on='id')
-        m = m[m['status'] == 'active']
-        
-        if not m.empty:
-            m['date_dt'] = pd.to_datetime(m['date'], format='%d/%m/%Y', errors='coerce')
-            m['Month'] = m['date_dt'].dt.strftime('%m/%Y')
+        if not df_p.empty and not df_l.empty and not df_i.empty:
+            m = pd.merge(df_p, df_l, left_on='id', right_on='project_id', suffixes=('_p', '_l'))
+            m = pd.merge(m, df_i, left_on='invoice_id', right_on='id')
+            m = m[m['status'] == 'active']
             
-            agg = m.groupby(['project_name', 'type'])['total_amount'].sum().unstack(fill_value=0).reset_index()
-            if 'IN' not in agg: agg['IN'] = 0
-            if 'OUT' not in agg: agg['OUT'] = 0
-            agg['Lãi'] = agg['OUT'] - agg['IN']
-            
-            last_date = m.groupby('project_name')['date_dt'].max().reset_index()
-            agg = pd.merge(agg, last_date, on='project_name').sort_values('date_dt', ascending=False)
+            if not m.empty:
+                m['date_dt'] = pd.to_datetime(m['date'], format='%d/%m/%Y', errors='coerce')
+                m['Month'] = m['date_dt'].dt.strftime('%m/%Y')
+                
+                agg = m.groupby(['project_name', 'type'])['total_amount'].sum().unstack(fill_value=0).reset_index()
+                if 'IN' not in agg: agg['IN'] = 0
+                if 'OUT' not in agg: agg['OUT'] = 0
+                agg['Lãi'] = agg['OUT'] - agg['IN']
+                
+                last_date = m.groupby('project_name')['date_dt'].max().reset_index()
+                agg = pd.merge(agg, last_date, on='project_name').sort_values('date_dt', ascending=False)
 
-            st.metric("TỔNG DOANH THU", format_vnd(agg['OUT'].sum()))
-            st.divider()
-            
-            for _, r in agg.iterrows():
-                with st.container():
-                    st.markdown(f"""
-                    <div class="report-card">
-                        <h4>📂 {r['project_name']}</h4>
-                        <hr style="margin: 5px 0;">
-                        <div style="display:flex; justify-content:space-between;">
-                            <div>Thu: <b>{format_vnd(r['OUT'])}</b></div>
-                            <div>Chi: <b>{format_vnd(r['IN'])}</b></div>
-                            <div style="color:{'#28a745' if r['Lãi']>=0 else 'red'}">Lãi: <b>{format_vnd(r['Lãi'])}</b></div>
+                st.metric("TỔNG DOANH THU", format_vnd(agg['OUT'].sum()))
+                st.divider()
+                
+                for _, r in agg.iterrows():
+                    with st.container():
+                        st.markdown(f"""
+                        <div class="report-card">
+                            <h4>📂 {r['project_name']}</h4>
+                            <hr style="margin: 5px 0;">
+                            <div style="display:flex; justify-content:space-between;">
+                                <div>Thu: <b>{format_vnd(r['OUT'])}</b></div>
+                                <div>Chi: <b>{format_vnd(r['IN'])}</b></div>
+                                <div style="color:{'#28a745' if r['Lãi']>=0 else 'red'}">Lãi: <b>{format_vnd(r['Lãi'])}</b></div>
+                            </div>
                         </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                        """, unsafe_allow_html=True)
+            else: st.info("Chưa có dữ liệu.")
         else: st.info("Chưa có dữ liệu.")
-    else: st.info("Chưa có dữ liệu.")
