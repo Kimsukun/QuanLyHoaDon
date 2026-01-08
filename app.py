@@ -9,12 +9,7 @@ import hashlib
 import sqlite3
 import os
 import shutil
-from PIL import Image
-# ==========================================
-# CẤU HÌNH ĐƯỜNG DẪN TESSERACT (QUAN TRỌNG)
-# ==========================================
-# Lưu ý: Dấu r'' ở trước để tránh lỗi ký tự đặc biệt trong đường dẫn Windows
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+from PIL import Image # Thêm thư viện xử lý ảnh
 
 # ==========================================
 # 1. CẤU HÌNH TRANG & KHỞI TẠO MÔI TRƯỜNG
@@ -46,9 +41,12 @@ def migrate_db_columns():
     conn = get_connection()
     c = conn.cursor()
     try:
+        # Thêm cột drive_link nếu chưa có
         c.execute("ALTER TABLE invoices ADD COLUMN drive_link TEXT")
     except: pass
+    
     try:
+        # Thêm cột request_edit (0: ko, 1: có yêu cầu duyệt sửa)
         c.execute("ALTER TABLE invoices ADD COLUMN request_edit INTEGER DEFAULT 0")
     except: pass
     conn.commit()
@@ -59,6 +57,7 @@ def init_db():
     c = conn.cursor()
     
     c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT, role TEXT, status TEXT)''')
+    # Thêm sẵn drive_link và request_edit vào bảng invoices
     c.execute('''CREATE TABLE IF NOT EXISTS invoices (
         id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, date TEXT, invoice_number TEXT, invoice_symbol TEXT, 
         seller_name TEXT, buyer_name TEXT, pre_tax_amount REAL, tax_amount REAL, total_amount REAL, 
@@ -84,7 +83,7 @@ def init_db():
 
 if not st.session_state.db_initialized:
     init_db()
-    migrate_db_columns()
+    migrate_db_columns() # Chạy migration để update cột mới
     st.session_state.db_initialized = True
 
 # --- CÁC HÀM HỖ TRỢ ---
@@ -171,8 +170,8 @@ def extract_numbers_from_line(line):
 
 def extract_data_smart(uploaded_file):
     text_content = ""
+    # Xác định loại file
     file_type = uploaded_file.type
-    msg = None
     
     try:
         # Xử lý PDF
@@ -180,19 +179,16 @@ def extract_data_smart(uploaded_file):
             with pdfplumber.open(uploaded_file) as pdf:
                 for page in pdf.pages: text_content += (page.extract_text() or "") + "\n"
         
-        # Xử lý Ảnh với Tesseract đã cấu hình
+        # Xử lý Ảnh (Cần cài pytesseract, nếu không có sẽ trả về rỗng để nhập tay)
         elif "image" in file_type:
             try:
+                import pytesseract
                 image = Image.open(uploaded_file)
-                # Thử đọc tiếng Việt trước, nếu lỗi thì đọc tiếng Anh mặc định
-                try:
-                    text_content = pytesseract.image_to_string(image, lang='vie')
-                except:
-                    text_content = pytesseract.image_to_string(image)
-            except Exception as e:
-                return {"date": "", "seller": "", "buyer": "", "inv_num": "", "inv_sym": "", "pre_tax": 0.0, "tax": 0.0, "total": 0.0, "all_numbers": []}, f"Lỗi OCR: {str(e)}. Hãy nhập tay."
+                text_content = pytesseract.image_to_string(image, lang='vie') # Thử tiếng Việt
+            except:
+                return {"date": "", "seller": "", "buyer": "", "inv_num": "", "inv_sym": "", "pre_tax": 0.0, "tax": 0.0, "total": 0.0, "all_numbers": []}, "Cần nhập tay (Không có OCR)"
 
-    except Exception as e: return None, f"Lỗi đọc file: {str(e)}"
+    except Exception as e: return None, f"Lỗi: {str(e)}"
     
     all_found_numbers = set()
     info = {"date": "", "seller": "", "buyer": "", "inv_num": "", "inv_sym": "", "pre_tax": 0.0, "tax": 0.0, "total": 0.0, "all_numbers": []}
@@ -228,7 +224,7 @@ def extract_data_smart(uploaded_file):
         elif re.search(r'^(Đơn vị mua|Người mua|Khách hàng|Bên B)', l_c, re.IGNORECASE): info["buyer"] = l_c.split(':')[-1].strip()
         
     info["all_numbers"] = list(all_found_numbers) 
-    return info, msg
+    return info, None
 
 # ==========================================
 # 4. GIAO DIỆN CHÍNH
@@ -578,5 +574,3 @@ elif menu == "3. Báo Cáo Tổng Hợp":
                     """, unsafe_allow_html=True)
         else: st.info(f"Không có dữ liệu cho tháng {selected_month}")
     else: st.info("Chưa có dữ liệu.")
-
-
